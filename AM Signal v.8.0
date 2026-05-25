@@ -1,0 +1,581 @@
+//@version=6
+indicator('Signal [Atom] v8.0 (Supertrend)', overlay = true, max_labels_count = 12, max_bars_back = 500)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. INPUTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// --- Main Settings ---
+mfi_len = input.int(7, 'MFI Length', group = 'MAIN SETTINGS')
+mfi_training = input.int(800, 'AI Training Size', group = 'MAIN SETTINGS')
+and_len = input.int(24, 'Andean Oscillator Length', group = 'MAIN SETTINGS')
+and_sig_len = input.int(6, 'Andean Signal Smoothing', group = 'MAIN SETTINGS')
+lookback = input.int(3, 'Confirmation Window', group = 'MAIN SETTINGS')
+
+// --- Supertrend ---
+st_period = input.int(10, 'Supertrend ATR Period', group = 'MAIN SETTINGS')
+st_factor = input.float(3.0, 'Supertrend Factor', group = 'MAIN SETTINGS', step = 0.01)
+st_trend_threshold = input.float(1.0, 'Strong Trend Threshold (%)', group = 'MAIN SETTINGS', minval = 0.1, step = 0.1)
+show_supertrend = input.bool(true, 'Show Supertrend', group = 'MAIN SETTINGS')
+
+// --- Advisor Settings ---
+max_allowed_lev = input.int(20, 'Max Leverage (Limit)', minval = 1, maxval = 100, group = 'ADVISOR SETTINGS')
+target_risk_depo = input.float(5.0, 'SL Risk (%)', minval = 1.0, maxval = 20.0, group = 'ADVISOR SETTINGS')
+lookback_trades = input.int(2, 'Last Signals Count', minval = 1, maxval = 50, group = 'ADVISOR SETTINGS')
+
+// --- Trade Settings ---
+use_auto_params = input.bool(true, 'Use Advisor Auto TP/SL', group = 'TRADE SETTINGS')
+tp_mult = input.float(1, 'Fixed Take Profit (xATR)', group = 'TRADE SETTINGS')
+sl_mult = input.float(1, 'Initial Stop Loss (xATR)', group = 'TRADE SETTINGS')
+use_trailing = input.bool(true, 'Enable Trailing Stop', group = 'TRADE SETTINGS')
+trail_atr_mult = input.float(1.6, 'Trailing Stop ATR Multiplier', group = 'TRADE SETTINGS')
+
+// --- Trend & Volatility Filters ---
+use_trend = input.bool(true, 'Trend Filter', group = 'FILTERS')
+use_atr = input.bool(true, 'ATR Filter', group = 'FILTERS')
+atr_period = input.int(14, 'ATR Period', group = 'FILTERS')
+atr_min = input.float(0.5, 'Min ATR %', group = 'FILTERS')
+atr_max = input.float(4.5, 'Max ATR %', group = 'FILTERS')
+
+// --- Visual Settings ---
+show_sl_tp = input.bool(true, 'Show SL/TP Lines', group = 'VISUALS')
+show_table = input.bool(true, 'Show Table', group = 'VISUALS')
+table_pos = input.string('Top Right', 'Table Position', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left'], group = 'VISUALS')
+buy_col = input.color(color.lime, 'BUY Label', group = 'VISUALS', inline = 'sig')
+sell_col = input.color(color.red, 'SELL Label', group = 'VISUALS', inline = 'sig')
+tp_col = input.color(color.new(color.lime, 30), 'TP Line', group = 'VISUALS', inline = 'tpsl')
+sl_col = input.color(color.new(color.red, 30), 'SL Line', group = 'VISUALS', inline = 'tpsl')
+trail_long_col = input.color(color.new(color.yellow, 20), 'Trail Long', group = 'VISUALS', inline = 'trail')
+trail_short_col = input.color(color.new(color.purple, 20), 'Trail Short', group = 'VISUALS', inline = 'trail')
+
+// --- Bollinger Bands ---
+bb_grp = 'BOLLINGER BANDS'
+show_bb = input.bool(true, 'Show Bollinger Bands', group = bb_grp)
+bb_len = input.int(20, 'Length', minval = 1, group = bb_grp)
+bb_maType = input.string('SMA', 'Basis MA Type', options = ['SMA', 'EMA', 'SMMA (RMA)', 'WMA', 'VWMA'], group = bb_grp)
+bb_src = input.source(close, 'Source', group = bb_grp)
+bb_mult = input.float(2.0, 'StdDev', minval = 0.001, maxval = 50, step = 0.5, group = bb_grp)
+bb_offset = input.int(0, 'Offset', minval = -500, maxval = 500, group = bb_grp)
+bb_basis_col = input.color(#2962FF, 'Basis', group = bb_grp, inline = 'bbcol')
+bb_upper_col = input.color(#F23645, 'Upper', group = bb_grp, inline = 'bbcol')
+bb_lower_col = input.color(#089981, 'Lower', group = bb_grp, inline = 'bbcol')
+bb_fill_col = input.color(color.rgb(33, 150, 243, 95), 'Fill', group = bb_grp, inline = 'bbcol')
+
+// --- S&R Power Channel ---
+sr_grp = 'S&R POWER CHANNEL'
+show_sr = input.bool(true, 'Show S&R Channel', group = sr_grp)
+sr_length = input.int(130, 'Lookback Length', group = sr_grp, minval = 10)
+sr_extend = input.int(30, 'Extend Bars', group = sr_grp, minval = 20, maxval = 100)
+sr_top_col = input.color(color.fuchsia, 'Resistance Color', group = sr_grp, inline = 'srcol')
+sr_bot_col = input.color(color.lime, 'Support Color', group = sr_grp, inline = 'srcol')
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+
+get_table_position(pos_str) =>
+    switch pos_str
+        'Top Right' => position.top_right
+        'Top Left' => position.top_left
+        'Bottom Right' => position.bottom_right
+        'Bottom Left' => position.bottom_left
+        => position.top_right
+
+table_position = get_table_position(table_pos)
+
+ma(source, length, _type) =>
+    switch _type
+        'SMA' => ta.sma(source, length)
+        'EMA' => ta.ema(source, length)
+        'SMMA (RMA)' => ta.rma(source, length)
+        'WMA' => ta.wma(source, length)
+        'VWMA' => ta.vwma(source, length)
+        => ta.sma(source, length)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. INDICATORS
+// ═════════════════════════════════════════════════════════════════════════════
+
+osc_mfi = ta.mfi(hlc3, mfi_len)
+
+// --- K-MEANS CLUSTERING ---
+kmeans_clustering(src, training_len) =>
+    safe_len = math.min(training_len, bar_index)
+    values = array.new_float(0)
+    for i = safe_len to 0 by 1
+        v = src[i]
+        if not na(v)
+            array.push(values, v)
+    size_vals = array.size(values)
+    if size_vals < 2
+        avg = size_vals > 0 ? array.avg(values) : 50.0
+        [avg, avg]
+    else
+        c1 = array.min(values)
+        c2 = array.max(values)
+        for _ = 0 to 9 by 1
+            cl1 = array.new_float(0)
+            cl2 = array.new_float(0)
+            for i = 0 to size_vals - 1 by 1
+                v = array.get(values, i)
+                if math.abs(v - c1) < math.abs(v - c2)
+                    array.push(cl1, v)
+                else
+                    array.push(cl2, v)
+            c1 := array.size(cl1) > 0 ? array.avg(cl1) : c1
+            c2 := array.size(cl2) > 0 ? array.avg(cl2) : c2
+            c2
+        [c1, c2]
+
+var bool kmeans_ready = false
+var float level_os = na
+var float level_ob = na
+
+recalc_kmeans = barstate.isconfirmed and bar_index % 5 == 0
+if recalc_kmeans or bar_index == 0
+    if bar_index >= math.min(mfi_training, 10)
+        [c1, c2] = kmeans_clustering(osc_mfi, mfi_training)
+        level_os := math.min(c1, c2)
+        level_ob := math.max(c1, c2)
+        kmeans_ready := true
+        kmeans_ready
+
+// --- ANDEAN OSCILLATOR ---
+alpha = 2.0 / (and_len + 1)
+var float upper_ema1 = na
+var float upper_ema2 = na
+var float lower_ema1 = na
+var float lower_ema2 = na
+
+upper_ema1 := nz(math.max(close, open, upper_ema1 - (upper_ema1 - close) * alpha), close)
+upper_ema2 := nz(math.max(close * close, open * open, upper_ema2 - (upper_ema2 - close * close) * alpha), close * close)
+lower_ema1 := nz(math.min(close, open, lower_ema1 + (close - lower_ema1) * alpha), close)
+lower_ema2 := nz(math.min(close * close, open * open, lower_ema2 + (close * close - lower_ema2) * alpha), close * close)
+
+and_osc = math.sqrt(math.max(0, lower_ema2 - lower_ema1 * lower_ema1)) - math.sqrt(math.max(0, upper_ema2 - upper_ema1 * upper_ema1))
+and_sig = ta.ema(and_osc, and_sig_len)
+
+// --- ATR ---
+atr_val = ta.atr(atr_period)
+atr14 = atr_period == 14 ? atr_val : ta.atr(14)
+atr_pct = atr_val / close * 100
+atr_ok = use_atr ? atr_pct >= atr_min and atr_pct <= atr_max : true
+
+// --- SUPERTREND ---
+[supertrend, direction] = ta.supertrend(st_factor, st_period)
+
+is_uptrend = direction < 0
+is_downtrend = direction > 0
+is_strong_trend = math.abs(close - supertrend) / supertrend * 100 > st_trend_threshold
+
+plot(show_supertrend and is_uptrend ? supertrend : na, 'Supertrend Up', color = color.rgb(0, 255, 8), style = plot.style_linebr, linewidth = 2)
+plot(show_supertrend and is_downtrend ? supertrend : na, 'Supertrend Down', color = color.rgb(255, 0, 0), style = plot.style_linebr, linewidth = 2)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. RAW SIGNALS
+// ═════════════════════════════════════════════════════════════════════════════
+
+mfi_bull_sig = ta.crossover(osc_mfi, level_os) and barstate.isconfirmed and kmeans_ready
+mfi_bear_sig = ta.crossunder(osc_mfi, level_ob) and barstate.isconfirmed and kmeans_ready
+and_bull_sig = ta.crossover(and_osc, and_sig) and barstate.isconfirmed and kmeans_ready
+and_bear_sig = ta.crossunder(and_osc, and_sig) and barstate.isconfirmed and kmeans_ready
+
+int bs_and_bull = ta.barssince(and_bull_sig)
+int bs_mfi_bull = ta.barssince(mfi_bull_sig)
+int bs_and_bear = ta.barssince(and_bear_sig)
+int bs_mfi_bear = ta.barssince(mfi_bear_sig)
+
+confirm_long = mfi_bull_sig and not na(bs_and_bull) and bs_and_bull <= lookback or and_bull_sig and not na(bs_mfi_bull) and bs_mfi_bull <= lookback
+confirm_short = mfi_bear_sig and not na(bs_and_bear) and bs_and_bear <= lookback or and_bear_sig and not na(bs_mfi_bear) and bs_mfi_bear <= lookback
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. STATE DECLARATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+var float long_entry = na
+var float long_trail = na
+var bool in_long = false
+var float long_sl_level = na
+var float long_tp_level = na
+
+var float short_entry = na
+var float short_trail = na
+var bool in_short = false
+var float short_sl_level = na
+var float short_tp_level = na
+
+var float fix_atr = na
+var int total_trades = 0
+var int win_trades = 0
+var float trade_tp_mult = 0.0
+var float trade_sl_mult = 0.0
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. SELF-LEARNING ADVISOR
+// ═════════════════════════════════════════════════════════════════════════════
+
+var array<float> long_best_tps = na
+var array<float> long_best_sls = na
+var array<float> short_best_tps = na
+var array<float> short_best_sls = na
+
+if bar_index == 0
+    long_best_tps := array.new_float(lookback_trades, tp_mult)
+    long_best_sls := array.new_float(lookback_trades, sl_mult)
+    short_best_tps := array.new_float(lookback_trades, tp_mult)
+    short_best_sls := array.new_float(lookback_trades, sl_mult)
+    short_best_sls
+
+var int last_total_trades = 0
+var float trade_entry_price = na
+var float trade_entry_atr = na
+var int trade_direction = 0
+
+if total_trades > last_total_trades
+    float move = not na(trade_entry_atr) and trade_entry_atr > 0 ? math.abs(close - trade_entry_price) / trade_entry_atr : 1.5
+    float new_tp = math.max(0.6, math.min(3.0, move))
+    float new_sl = math.max(1.0, math.min(2.5, move))
+    if trade_direction == 1
+        array.push(long_best_tps, new_tp)
+        array.remove(long_best_tps, 0)
+        array.push(long_best_sls, new_sl)
+        array.remove(long_best_sls, 0)
+    else if trade_direction == -1
+        array.push(short_best_tps, new_tp)
+        array.remove(short_best_tps, 0)
+        array.push(short_best_sls, new_sl)
+        array.remove(short_best_sls, 0)
+    last_total_trades := total_trades
+    last_total_trades
+
+float long_learned_tp = array.avg(long_best_tps)
+float long_learned_sl = array.avg(long_best_sls)
+float short_learned_tp = array.avg(short_best_tps)
+float short_learned_sl = array.avg(short_best_sls)
+
+atr_sma100 = ta.sma(atr14, 100)
+float vol_adjust = atr_sma100 > 0 ? math.max(1.0, math.min(2.0, atr14 / atr_sma100)) : 1.0
+
+float long_suggested_tp = (is_strong_trend ? long_learned_tp : long_learned_tp) * vol_adjust
+float long_suggested_sl = long_learned_sl
+float short_suggested_tp = (is_strong_trend ? short_learned_tp : short_learned_tp) * vol_adjust
+float short_suggested_sl = short_learned_sl
+
+float suggested_tp = in_long ? long_suggested_tp : in_short ? short_suggested_tp : (long_suggested_tp + short_suggested_tp) / 2
+float suggested_sl = in_long ? long_suggested_sl : in_short ? short_suggested_sl : (long_suggested_sl + short_suggested_sl) / 2
+float suggested_lev = math.max(math.floor(math.min(target_risk_depo / math.max(suggested_sl, 0.1), max_allowed_lev)), 1.0)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6.5 ANDEAN REVERSAL ADVISOR
+// ═════════════════════════════════════════════════════════════════════════════
+
+bool and_reversal_vs_long = in_long and ta.crossunder(and_osc, and_sig) and barstate.isconfirmed
+bool and_reversal_vs_short = in_short and ta.crossover(and_osc, and_sig) and barstate.isconfirmed
+
+var bool reversal_warn = false
+if and_reversal_vs_long or and_reversal_vs_short
+    reversal_warn := true
+    reversal_warn
+if not in_long and not in_short
+    reversal_warn := false
+    reversal_warn
+
+float current_pnl_atr = 0.0
+if in_long and not na(long_entry) and not na(fix_atr) and fix_atr > 0
+    current_pnl_atr := (close - long_entry) / fix_atr
+    current_pnl_atr
+else if in_short and not na(short_entry) and not na(fix_atr) and fix_atr > 0
+    current_pnl_atr := (short_entry - close) / fix_atr
+    current_pnl_atr
+
+string rev_text = ''
+color rev_color = color.gray
+if reversal_warn and (in_long or in_short)
+    if current_pnl_atr >= 0.3
+        rev_text := '⚠️ Consider Exit'
+        rev_color := color.orange
+        rev_color
+    else if current_pnl_atr > -0.2
+        rev_text := '⚠️ Move to BE'
+        rev_color := color.yellow
+        rev_color
+    else
+        rev_text := '⚠️ High Risk'
+        rev_color := color.red
+        rev_color
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6.6 S&R POWER CHANNEL
+// ═════════════════════════════════════════════════════════════════════════════
+
+type sr_data
+	line sup = na
+	line res = na
+	box sup_area = na
+	box res_area = na
+
+sr_max_min(len) =>
+    var array<float> sr_max_arr = array.new_float(len, na)
+    var array<float> sr_min_arr = array.new_float(len, na)
+    if barstate.islast
+        for i = 0 to len - 1 by 1
+            array.set(sr_max_arr, i, high[i])
+            array.set(sr_min_arr, i, low[i])
+    [array.max(sr_max_arr), array.min(sr_min_arr)]
+
+sr_delte(sr_data d) =>
+    field_0 = d.sup
+    line.delete(field_0[1])
+    field_1 = d.res
+    line.delete(field_1[1])
+    field_2 = d.sup_area
+    box.delete(field_2[1])
+    field_3 = d.res_area
+    box.delete(field_3[1])
+
+sr_power(sr_data d) =>
+    if barstate.islast and not na(d.sup_area) and not na(d.res_area)
+        int buy = 0
+        int sell = 0
+        for i = 0 to sr_length - 1 by 1
+            buy := buy + (close[i] > open[i] ? 1 : 0)
+            sell := sell + (close[i] < open[i] ? 1 : 0)
+            sell
+        d.sup_area.set_text(str.tostring(buy, '            Buy Power: #'))
+        d.res_area.set_text(str.tostring(sell, '            Sell Power: #'))
+        d.res_area.set_text_color(chart.fg_color)
+        d.sup_area.set_text_color(chart.fg_color)
+        d.res_area.set_text_halign(text.align_left)
+        d.sup_area.set_text_halign(text.align_left)
+        d.res_area.set_text_size(size.normal)
+        d.sup_area.set_text_size(size.normal)
+
+sr_signals(sr_data d) =>
+    if barstate.islast and not na(d.sup_area) and not na(d.res_area)
+        for i = 0 to sr_length - 1 by 1
+            low_1 = low[i]
+            low_2 = low[i > 0 ? i + 1 : i]
+            high_1 = high[i]
+            high_2 = high[i > 0 ? i + 1 : i]
+            idx = bar_index - i
+            top = d.sup_area.get_top()
+            bot = d.res_area.get_bottom()
+            if low_1 > top and low_2 <= top
+                label.new(idx, low_2, '◈', textcolor = sr_bot_col, color = color(na), style = label.style_label_up, size = size.large)
+            if high_1 < bot and high_2 >= bot
+                label.new(idx, high_2, '◈', textcolor = sr_top_col, color = color(na), style = label.style_label_down, size = size.large)
+
+sr_run() =>
+    float sr_atr = ta.atr(200) * 0.5
+    var sr_data d = sr_data.new()
+    [sr_max, sr_min] = sr_max_min(sr_length)
+
+    if barstate.islast
+        float sr_mid = math.avg(sr_max, sr_min)
+        label.delete(label.new(bar_index + sr_extend + 15, sr_max, str.tostring(sr_max, '🡅 #.##'), color = color(na), style = label.style_label_center, textcolor = chart.fg_color)[1])
+        label.delete(label.new(bar_index + sr_extend + 15, sr_min, str.tostring(sr_min, '🡇 #.##'), color = color(na), style = label.style_label_center, textcolor = chart.fg_color)[1])
+        label.delete(label.new(bar_index + sr_extend, sr_mid, str.tostring(sr_mid, '🡆 #.##'), color = color(na), style = label.style_label_left, textcolor = color.gray)[1])
+        line.delete(line.new(bar_index - sr_length, sr_mid, bar_index + sr_extend, sr_mid, color = color.gray, style = line.style_dotted)[1])
+        var array<float> tmp_high = array.new_float(sr_length, na)
+        var array<float> tmp_low = array.new_float(sr_length, na)
+        for i = 0 to sr_length - 1 by 1
+            array.set(tmp_high, i, high[i])
+            array.set(tmp_low, i, low[i])
+        int idx_max = array.indexof(tmp_high, sr_max)
+        int idx_min = array.indexof(tmp_low, sr_min)
+        label.delete(label.new(bar_index[idx_max], sr_max, '✖', color = color(na), textcolor = sr_top_col, size = size.normal, style = label.style_label_center)[1])
+        label.delete(label.new(bar_index[idx_min], sr_min, '✖', color = color(na), textcolor = sr_bot_col, size = size.normal, style = label.style_label_center)[1])
+        d.res := line.new(bar_index - sr_length, sr_max + sr_atr, bar_index + sr_extend + 30, sr_max + sr_atr, color = sr_top_col, style = line.style_solid)
+        d.sup := line.new(bar_index - sr_length, sr_min - sr_atr, bar_index + sr_extend + 30, sr_min - sr_atr, color = sr_bot_col, style = line.style_solid)
+        d.res_area := box.new(bar_index - sr_length, sr_max + sr_atr, bar_index + sr_extend, sr_max - sr_atr, na, bgcolor = color.new(sr_top_col, 80))
+        d.sup_area := box.new(bar_index - sr_length, sr_min + sr_atr, bar_index + sr_extend, sr_min - sr_atr, na, bgcolor = color.new(sr_bot_col, 80))
+        d.sup_area
+
+    sr_delte(d)
+    sr_signals(d)
+    sr_power(d)
+
+if show_sr
+    sr_run()
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. FINAL SIGNALS
+// ═════════════════════════════════════════════════════════════════════════════
+
+bool warmed_up = bar_index >= mfi_training
+
+long_signal = confirm_long and warmed_up and (use_trend ? is_uptrend : true) and atr_ok and not in_long[1] and not in_short[1]
+short_signal = confirm_short and warmed_up and (use_trend ? is_downtrend : true) and atr_ok and not in_short[1] and not in_long[1]
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. TRADE MANAGEMENT
+// ═════════════════════════════════════════════════════════════════════════════
+
+// --- LONG ENTRY ---
+if long_signal and not in_long and not in_short
+    in_long := true
+    long_entry := close
+    fix_atr := atr_val
+    trade_tp_mult := use_auto_params ? long_suggested_tp : tp_mult
+    trade_sl_mult := use_auto_params ? long_suggested_sl : sl_mult
+    long_sl_level := close - fix_atr * trade_sl_mult
+    long_tp_level := close + fix_atr * trade_tp_mult
+    long_trail := long_sl_level
+    trade_entry_price := close
+    trade_entry_atr := atr_val
+    trade_direction := 1
+    trade_direction
+
+// --- LONG EXIT ---
+else if in_long
+    if high >= long_tp_level
+        in_long := false
+        total_trades := total_trades + 1
+        win_trades := win_trades + 1
+        win_trades
+    else
+        float current_trail_mult = use_trailing ? trail_atr_mult : trade_sl_mult
+        long_trail := math.max(long_trail, close - fix_atr * current_trail_mult)
+        if low <= long_trail
+            in_long := false
+            total_trades := total_trades + 1
+            if long_trail >= long_entry
+                win_trades := win_trades + 1
+                win_trades
+
+// --- SHORT ENTRY ---
+if short_signal and not in_short and not in_long
+    in_short := true
+    short_entry := close
+    fix_atr := atr_val
+    trade_tp_mult := use_auto_params ? short_suggested_tp : tp_mult
+    trade_sl_mult := use_auto_params ? short_suggested_sl : sl_mult
+    short_sl_level := close + fix_atr * trade_sl_mult
+    short_tp_level := close - fix_atr * trade_tp_mult
+    short_trail := short_sl_level
+    trade_entry_price := close
+    trade_entry_atr := atr_val
+    trade_direction := -1
+    trade_direction
+
+// --- SHORT EXIT ---
+else if in_short
+    if low <= short_tp_level
+        in_short := false
+        total_trades := total_trades + 1
+        win_trades := win_trades + 1
+        win_trades
+    else
+        float current_trail_mult = use_trailing ? trail_atr_mult : trade_sl_mult
+        short_trail := math.min(short_trail, close + fix_atr * current_trail_mult)
+        if high >= short_trail
+            in_short := false
+            total_trades := total_trades + 1
+            if short_trail <= short_entry
+                win_trades := win_trades + 1
+                win_trades
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 9. VISUALS
+// ═════════════════════════════════════════════════════════════════════════════
+
+plotshape(long_signal, title = 'BUY Label', text = 'BUY', textcolor = color.white, style = shape.labelup, location = location.belowbar, color = buy_col, size = size.small)
+
+plotshape(short_signal, title = 'SELL Label', text = 'SELL', textcolor = color.white, style = shape.labeldown, location = location.abovebar, color = sell_col, size = size.small)
+
+plot(show_sl_tp ? in_long ? long_tp_level : na : na, 'Long TP', color = tp_col, style = plot.style_cross, linewidth = 2)
+plot(show_sl_tp ? in_short ? short_tp_level : na : na, 'Short TP', color = tp_col, style = plot.style_cross, linewidth = 2)
+plot(show_sl_tp ? in_long ? long_sl_level : na : na, 'Long SL', color = sl_col, style = plot.style_cross, linewidth = 1)
+plot(show_sl_tp ? in_short ? short_sl_level : na : na, 'Short SL', color = sl_col, style = plot.style_cross, linewidth = 1)
+
+plot(in_long and use_trailing ? long_trail : na, 'L-Trail', color = trail_long_col, style = plot.style_circles, linewidth = 1)
+plot(in_short and use_trailing ? short_trail : na, 'S-Trail', color = trail_short_col, style = plot.style_circles, linewidth = 1)
+
+basis = ma(bb_src, bb_len, bb_maType)
+dev = bb_mult * ta.stdev(bb_src, bb_len)
+upper = basis + dev
+lower = basis - dev
+plot(show_bb ? basis : na, 'Basis', color = bb_basis_col, offset = bb_offset)
+p1 = plot(show_bb ? upper : na, 'Upper', color = bb_upper_col, offset = bb_offset)
+p2 = plot(show_bb ? lower : na, 'Lower', color = bb_lower_col, offset = bb_offset)
+fill(p1, p2, title = 'BB Background', color = show_bb ? bb_fill_col : color.new(color.white, 100))
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 10. TABLE
+// ═════════════════════════════════════════════════════════════════════════════
+
+if show_table and barstate.islast
+    win_rate = total_trades > 0 ? win_trades / total_trades * 100 : 0
+    tbl = table.new(table_position, 2, 20, bgcolor = color.new(color.black, 70), border_width = 1, border_color = color.gray, frame_color = color.gray, frame_width = 1)
+
+    // MARKET
+    table.cell(tbl, 0, 0, '📊 MARKET', text_color = #1b02fa, text_size = size.small)
+    table.cell(tbl, 1, 0, '', text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 1, 'Trend:', text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 1, is_uptrend ? 'BULL 🟢' : 'BEAR 🔴', text_color = is_uptrend ? color.lime : color.red, text_size = size.small)
+    table.cell(tbl, 0, 2, 'ATR %:', text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 2, str.tostring(atr_pct, '#.##') + '%', text_color = atr_ok ? color.lime : color.red, text_size = size.small)
+    table.cell(tbl, 0, 3, '', text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 3, '', text_color = color.gray, text_size = size.small)
+
+    // STATS
+    table.cell(tbl, 0, 4, '📈 STATS', text_color = #1b02fa, text_size = size.small)
+    table.cell(tbl, 1, 4, '', text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 5, 'Win Rate:', text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 5, str.tostring(win_rate, '#.#') + '%', text_color = win_rate >= 50 ? color.lime : color.orange, text_size = size.small)
+    table.cell(tbl, 0, 6, 'Trades:', text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 6, str.tostring(win_trades) + ' / ' + str.tostring(total_trades), text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 7, '', text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 7, '', text_color = color.gray, text_size = size.small)
+
+    // ADVISOR
+    string advisor_dir = in_long ? '🟢 LONG mode' : in_short ? '🔴 SHORT mode' : is_strong_trend ? 'TREND 📈' : 'RANGE 📊'
+    color advisor_col = in_long ? color.lime : in_short ? color.red : is_strong_trend ? color.lime : color.yellow
+    table.cell(tbl, 0, 8, '🎯 ADVISOR', text_color = #1b02fa, text_size = size.small)
+    table.cell(tbl, 1, 8, advisor_dir, text_color = advisor_col, text_size = size.small)
+
+    string pos_status = ''
+    color pos_color = color.gray
+    if in_long or in_short
+        if reversal_warn and rev_text != ''
+            pos_status := rev_text
+            pos_color := rev_color
+            pos_color
+        else
+            string pnl_sign = current_pnl_atr >= 0 ? '+' : ''
+            pos_status := 'PnL: ' + pnl_sign + str.tostring(current_pnl_atr, '#.##') + ' ATR'
+            pos_color := current_pnl_atr >= 0 ? color.lime : color.red
+            pos_color
+    table.cell(tbl, 0, 9, 'Position:', text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 9, pos_status, text_color = pos_color, text_size = size.small, bgcolor = reversal_warn and (in_long or in_short) ? color.new(color.orange, 80) : color.new(color.black, 100))
+
+    table.cell(tbl, 0, 10, 'L-TP learned:', text_color = color.lime, text_size = size.small)
+    table.cell(tbl, 1, 10, str.tostring(long_learned_tp, '#.##') + 'x', text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 0, 11, 'L-SL learned:', text_color = color.lime, text_size = size.small)
+    table.cell(tbl, 1, 11, str.tostring(long_learned_sl, '#.##') + 'x', text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 0, 12, 'S-TP learned:', text_color = color.red, text_size = size.small)
+    table.cell(tbl, 1, 12, str.tostring(short_learned_tp, '#.##') + 'x', text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 0, 13, 'S-SL learned:', text_color = color.red, text_size = size.small)
+    table.cell(tbl, 1, 13, str.tostring(short_learned_sl, '#.##') + 'x', text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 0, 14, '', text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 14, '', text_color = color.gray, text_size = size.small)
+
+    table.cell(tbl, 0, 15, 'Suggest. TP:', text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 15, str.tostring(suggested_tp, '#.##') + 'x ATR', text_color = color.lime, text_size = size.small)
+    table.cell(tbl, 0, 16, 'Suggest. SL:', text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 16, str.tostring(suggested_sl, '#.##') + 'x ATR', text_color = color.orange, text_size = size.small)
+    table.cell(tbl, 0, 17, 'Rec. Leverage:', text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 17, 'x' + str.tostring(suggested_lev, '#'), text_color = color.yellow, text_size = size.small)
+    table.cell(tbl, 0, 18, 'Vol. Adj.:', text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 18, str.tostring(vol_adjust, '#.##'), text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 0, 19, '', text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 19, '', text_color = color.gray, text_size = size.small)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 11. ALERTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+alertcondition(long_signal, 'BUY Signal', 'BUY @ {{close}} | Enter next bar open')
+alertcondition(short_signal, 'SELL Signal', 'SELL @ {{close}} | Enter next bar open')
+alertcondition(and_reversal_vs_long, 'Long Reversal', 'Reversal vs LONG @ {{close}} | Consider exit or move SL to BE')
+alertcondition(and_reversal_vs_short, 'Short Reversal', 'Reversal vs SHORT @ {{close}} | Consider exit or move SL to BE')
