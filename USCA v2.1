@@ -1,0 +1,566 @@
+//@version=6
+indicator("UT Bot + Supertrend + CHOP + Advisor v2.1", overlay = true)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. INPUTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// --- Filter Mode ---
+filter_grp = "FILTER MODE"
+use_st     = input.bool(true, "Use Supertrend Filter", group = filter_grp)
+use_chop   = input.bool(true, "Use CHOP Filter",       group = filter_grp)
+
+// --- UT Bot ---
+a = input.float(1.0,  "UT: Key Value (Sensitivity)", group = "UT BOT")
+c = input.int(10,     "UT: ATR Period",               group = "UT BOT")
+h = input.bool(false, "UT: Signals from Heikin Ashi", group = "UT BOT")
+
+// --- Supertrend ---
+atrPeriod    = input.int(10,    "ST: ATR Length",           minval = 1,    group = "SUPERTREND")
+factor       = input.float(3.0, "ST: Factor",               minval = 0.01, group = "SUPERTREND", step = 0.01)
+st_up_col    = input.color(color.rgb(0, 255, 0),                    "ST: Up Trend Color",       group = "SUPERTREND")
+st_dn_col    = input.color(color.rgb(255, 0, 0),                      "ST: Down Trend Color",     group = "SUPERTREND")
+st_up_bg_col = input.color(color.new(color.green, 90),     "ST: Up Trend Background",  group = "SUPERTREND")
+st_dn_bg_col = input.color(color.new(color.red,   90),     "ST: Down Trend Background",group = "SUPERTREND")
+
+// --- CHOP Filter ---
+chop_grp       = "CHOP FILTER"
+chop_length    = input.int(14,     "CHOP Length",          group = chop_grp, minval = 1)
+chop_threshold = input.float(61.8, "CHOP Threshold",       group = chop_grp, minval = 1.0, maxval = 100.0, step = 0.1)
+show_chop_bg   = input.bool(true,  "Show CHOP Background", group = chop_grp)
+
+// --- Advisor ---
+max_allowed_lev  = input.int(20,   "Max Leverage (Limit)",  minval = 1, maxval = 100,   group = "ADVISOR")
+target_risk_depo = input.float(5.0,"SL Risk (%)",           minval = 1.0, maxval = 20.0, group = "ADVISOR")
+lookback_trades  = input.int(31,   "Trades for Learning",   minval = 2, maxval = 100,   group = "ADVISOR")
+// Adaptive SL: number of bars for candlestick range analysis
+sl_bars_lookback = input.int(8,    "SL: Bars for Range",    minval = 1, maxval = 20,    group = "ADVISOR",
+                   tooltip = "The number of recent bars for calculating the adaptive SL.\nIf the actual candle range is > ATR, the SL is expanded automatically.")
+
+// --- Trade Settings ---
+use_auto_params = input.bool(true,  "Use Advisor Auto TP/SL",       group = "TRADE SETTINGS")
+tp_mult         = input.float(1.0,  "Fixed Take Profit (xATR)",     group = "TRADE SETTINGS")
+sl_mult         = input.float(1.0,  "Fixed Stop Loss (xATR)",       group = "TRADE SETTINGS")
+use_trailing    = input.bool(false, "Enable Trailing Stop",         group = "TRADE SETTINGS")
+trail_mult      = input.float(1.8,  "Trailing Stop ATR Multiplier", group = "TRADE SETTINGS")
+
+// --- Visuals ---
+show_sl_tp  = input.bool(true,        "Show SL/TP Lines",  group = "VISUALS")
+show_table  = input.bool(true,        "Show Table",        group = "VISUALS")
+table_pos   = input.string("Top Right", "Table Position",
+              options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "VISUALS")
+buy_col     = input.color(color.green,  "BUY Label",  group = "VISUALS", inline = "sig")
+sell_col    = input.color(color.red,    "SELL Label", group = "VISUALS", inline = "sig")
+tp_col      = input.color(color.lime,   "TP Line",    group = "VISUALS", inline = "tpsl")
+sl_col      = input.color(color.red,    "SL Line",    group = "VISUALS", inline = "tpsl")
+trail_col   = input.color(color.yellow, "Trail Line", group = "VISUALS", inline = "tpsl")
+
+
+// --- Bollinger Bands ---
+bb_grp       = "BOLLINGER BANDS"
+show_bb      = input.bool(true,   "Show Bollinger Bands", group = bb_grp)
+bb_len       = input.int(20,      "Length", minval = 1,   group = bb_grp)
+bb_maType    = input.string("SMA","Basis MA Type",
+               options = ["SMA", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group = bb_grp)
+bb_src       = input.source(close,"Source",                group = bb_grp)
+bb_mult      = input.float(2.0,   "StdDev", minval = 0.001, maxval = 50, step = 0.5, group = bb_grp)
+bb_offset    = input.int(0,       "Offset", minval = -500,  maxval = 500, group = bb_grp)
+bb_basis_col = input.color(color.rgb(255, 100, 15),      "Basis", group = bb_grp, inline = "bbcol")
+bb_upper_col = input.color(color.rgb(55, 55, 255),         "Upper", group = bb_grp, inline = "bbcol")
+bb_lower_col = input.color(color.rgb(55, 55, 255),         "Lower", group = bb_grp, inline = "bbcol")
+bb_fill_col  = input.color(color.rgb(33, 150, 243, 95),  "Fill",  group = bb_grp, inline = "bbcol")
+
+// --- S&R Power Channel ---
+sr_grp     = "S&R POWER CHANNEL"
+show_sr    = input.bool(true,                     "Show S&R Channel",  group = sr_grp)
+sr_length  = input.int(130,                       "Lookback Length",   group = sr_grp, minval = 10)
+sr_extend  = input.int(30,                        "Extend Bars",       group = sr_grp, minval = 20, maxval = 100)
+sr_top_col = input.color(color.new(#cfcfcf, 85), "Res. Color",  group = sr_grp, inline = "srcol")
+sr_bot_col = input.color(color.new(#0ddcfc, 85), "Sup. Color",     group = sr_grp, inline = "srcol")
+sr_sigtop_col = input.color(color.new(#eeefef, 23), 'Res. signal', group = sr_grp, inline = 'srcol')
+sr_sigbot_col = input.color(color.new(#05deff, 23), 'Sup. signal', group = sr_grp, inline = 'srcol')
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+
+get_pos(pos_str) =>
+    switch pos_str
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+tbl_pos = get_pos(table_pos)
+
+ma(source, length, _type) =>
+    switch _type
+        "SMA"        => ta.sma(source, length)
+        "EMA"        => ta.ema(source, length)
+        "SMMA (RMA)" => ta.rma(source, length)
+        "WMA"        => ta.wma(source, length)
+        "VWMA"       => ta.vwma(source, length)
+        =>               ta.sma(source, length)
+
+array_median(float[] arr) =>
+    float result = na
+    int sz = array.size(arr)
+    if sz > 0
+        float[] s = array.copy(arr)
+        for i = 1 to sz - 1
+            float key = array.get(s, i)
+            int   j   = i - 1
+            while j >= 0 and array.get(s, j) > key
+                array.set(s, j + 1, array.get(s, j))
+                j -= 1
+            array.set(s, j + 1, key)
+        result := sz % 2 == 1
+             ? array.get(s, sz / 2)
+             : (array.get(s, sz / 2 - 1) + array.get(s, sz / 2)) / 2.0
+    result
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2.1 S&R POWER CHANNEL
+// ═════════════════════════════════════════════════════════════════════════════
+
+type sr_data
+    line sup      = na
+    line res      = na
+    box  sup_area = na
+    box  res_area = na
+
+sr_max_min(len) =>
+    var array<float> sr_max_arr = array.new_float(len, na)
+    var array<float> sr_min_arr = array.new_float(len, na)
+    if barstate.islast
+        for i = 0 to len - 1
+            array.set(sr_max_arr, i, high[i])
+            array.set(sr_min_arr, i, low[i])
+    [array.max(sr_max_arr), array.min(sr_min_arr)]
+
+sr_delte(sr_data d) =>
+    sup_prev = d.sup
+    res_prev = d.res
+    sup_area_prev = d.sup_area
+    res_area_prev = d.res_area
+    line.delete(sup_prev[1])
+    line.delete(res_prev[1])
+    box.delete(sup_area_prev[1])
+    box.delete(res_area_prev[1])
+
+sr_power(sr_data d) =>
+    if barstate.islast and not na(d.sup_area) and not na(d.res_area)
+        int buy  = 0
+        int sell = 0
+        for i = 0 to sr_length - 1
+            buy  += close[i] > open[i] ? 1 : 0
+            sell += close[i] < open[i] ? 1 : 0
+        d.sup_area.set_text(str.tostring(buy,  "            Buy Power: #"))
+        d.res_area.set_text(str.tostring(sell, "            Sell Power: #"))
+        d.res_area.set_text_color(chart.fg_color)
+        d.sup_area.set_text_color(chart.fg_color)
+        d.res_area.set_text_halign(text.align_left)
+        d.sup_area.set_text_halign(text.align_left)
+        d.res_area.set_text_size(size.normal)
+        d.sup_area.set_text_size(size.normal)
+
+sr_signals(sr_data d) =>
+    if barstate.islast and not na(d.sup_area) and not na(d.res_area)
+        for i = 0 to sr_length - 1
+            low_1  = low[i]
+            low_2  = low[i > 0 ? i + 1 : i]
+            high_1 = high[i]
+            high_2 = high[i > 0 ? i + 1 : i]
+            idx    = bar_index - i
+            top    = d.sup_area.get_top()
+            bot    = d.res_area.get_bottom()
+            if low_1 > top and low_2 <= top
+                label.new(idx, low_2, '◈', textcolor = sr_sigbot_col, color = color(na), style = label.style_label_up, size = size.large)
+            if high_1 < bot and high_2 >= bot
+                label.new(idx, high_2, '◈', textcolor = sr_sigtop_col, color = color(na), style = label.style_label_down, size = size.large)
+
+sr_run() =>
+    float sr_atr = ta.atr(200) * 0.5
+    var sr_data d = sr_data.new()
+    [sr_max, sr_min] = sr_max_min(sr_length)
+
+    if barstate.islast
+        float sr_mid = math.avg(sr_max, sr_min)
+        label.delete(label.new(bar_index + sr_extend + 15, sr_max,
+             str.tostring(sr_max, " #.##"), color = color(na),
+             style = label.style_label_center, textcolor = chart.fg_color)[1])
+        label.delete(label.new(bar_index + sr_extend + 15, sr_min,
+             str.tostring(sr_min, " #.##"), color = color(na),
+             style = label.style_label_center, textcolor = chart.fg_color)[1])
+        label.delete(label.new(bar_index + sr_extend, sr_mid,
+             str.tostring(sr_mid, " #.##"), color = color(na),
+             style = label.style_label_left, textcolor = color.gray)[1])
+        line.delete(line.new(bar_index - sr_length, sr_mid,
+             bar_index + sr_extend, sr_mid,
+             color = color.gray, style = line.style_dotted)[1])
+
+        var array<float> tmp_high = array.new_float(sr_length, na)
+        var array<float> tmp_low  = array.new_float(sr_length, na)
+        for i = 0 to sr_length - 1
+            array.set(tmp_high, i, high[i])
+            array.set(tmp_low,  i, low[i])
+        int idx_max = array.indexof(tmp_high, sr_max)
+        int idx_min = array.indexof(tmp_low,  sr_min)
+        label.delete(label.new(bar_index[idx_max], sr_max, '✖', color = color(na), textcolor = sr_sigtop_col, size = size.normal, style = label.style_label_center)[1])
+        label.delete(label.new(bar_index[idx_min], sr_min, '✖', color = color(na), textcolor = sr_sigbot_col, size = size.normal, style = label.style_label_center)[1])
+
+        d.res      := line.new(bar_index - sr_length, sr_max + sr_atr,
+                               bar_index + sr_extend + 30, sr_max + sr_atr,
+                               color = sr_top_col, style = line.style_solid)
+        d.sup      := line.new(bar_index - sr_length, sr_min - sr_atr,
+                               bar_index + sr_extend + 30, sr_min - sr_atr,
+                               color = sr_bot_col, style = line.style_solid)
+        d.res_area := box.new(bar_index - sr_length, sr_max + sr_atr,
+                              bar_index + sr_extend,  sr_max - sr_atr,
+                              na, bgcolor = sr_top_col)
+        d.sup_area := box.new(bar_index - sr_length, sr_min + sr_atr,
+                              bar_index + sr_extend,  sr_min - sr_atr,
+                              na, bgcolor = sr_bot_col)
+
+    sr_delte(d)
+    sr_signals(d)
+    sr_power(d)
+
+if show_sr
+    sr_run()
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. UT BOT
+// ═════════════════════════════════════════════════════════════════════════════
+
+src = close
+if h
+    ha_ticker = ticker.heikinashi(syminfo.tickerid)
+    src := request.security(ha_ticker, timeframe.period, close,
+           gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+xATR  = ta.atr(c)
+nLoss = a * xATR
+
+var float xATRTrailingStop = 0.0
+float prev_stop = nz(xATRTrailingStop[1])
+xATRTrailingStop :=
+     src > prev_stop and src[1] > prev_stop ? math.max(prev_stop, src - nLoss) :
+     src < prev_stop and src[1] < prev_stop ? math.min(prev_stop, src + nLoss) :
+     src > prev_stop                        ? src - nLoss :
+                                              src + nLoss
+
+above   = ta.crossover(src,  xATRTrailingStop)
+below   = ta.crossunder(src, xATRTrailingStop)
+ut_buy  = src > xATRTrailingStop and above
+ut_sell = src < xATRTrailingStop and below
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. SUPERTREND
+// ═════════════════════════════════════════════════════════════════════════════
+
+[supertrend, direction] = ta.supertrend(factor, atrPeriod)
+st_bullish = direction < 0
+st_bearish = direction > 0
+
+upTrend    = plot(st_bullish ? supertrend : na, "Up Trend",
+             color = st_up_col, style = plot.style_linebr)
+downTrend  = plot(st_bearish ? supertrend : na, "Down Trend",
+             color = st_dn_col, style = plot.style_linebr)
+bodyMiddle = plot(barstate.isfirst ? na : (open + close) / 2, "Body Middle",
+             display = display.none)
+fill(bodyMiddle, upTrend,   title = "Uptrend BG",   color = st_up_bg_col, fillgaps = false)
+fill(bodyMiddle, downTrend, title = "Downtrend BG", color = st_dn_bg_col, fillgaps = false)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. CHOP INDEX
+// ═════════════════════════════════════════════════════════════════════════════
+
+ci = 100 * math.log10(math.sum(ta.atr(1), chop_length) /
+     (ta.highest(chop_length) - ta.lowest(chop_length))) / math.log10(chop_length)
+
+bool chop_trend = ci < chop_threshold
+
+bgcolor(show_chop_bg and not chop_trend ? color.new(color.orange, 90) : na,
+        title = "CHOP Sideways BG")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. FILTER LOGIC
+// ═════════════════════════════════════════════════════════════════════════════
+
+st_ok_long  = use_st ? st_bullish : true
+st_ok_short = use_st ? st_bearish : true
+chop_ok     = use_chop ? chop_trend : true
+
+buy  = ut_buy  and st_ok_long  and chop_ok
+sell = ut_sell and st_ok_short and chop_ok
+
+barbuy  = use_st ? st_bullish : (src > xATRTrailingStop)
+barsell = use_st ? st_bearish : (src < xATRTrailingStop)
+barcolor(barbuy ? buy_col : barsell ? sell_col : na, title = "Bar Color")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. ATR for traiding
+// ═════════════════════════════════════════════════════════════════════════════
+
+trade_atr = ta.atr(14)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. STATE
+// ═════════════════════════════════════════════════════════════════════════════
+
+var float long_entry    = na
+var float long_tp       = na
+var float long_sl       = na
+var float long_trail    = na
+var bool  in_long       = false
+
+var float short_entry   = na
+var float short_tp      = na
+var float short_sl      = na
+var float short_trail   = na
+var bool  in_short      = false
+
+var float fix_atr       = na
+var int   total_trades  = 0
+var int   win_trades    = 0
+var float trade_tp_mult = 0.0
+var float trade_sl_mult = 0.0
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 9. SELF-LEARNING ADVISOR
+// ═════════════════════════════════════════════════════════════════════════════
+
+var float[] long_best_tps  = na
+var float[] long_best_sls  = na
+var float[] short_best_tps = na
+var float[] short_best_sls = na
+
+if bar_index == 0
+    long_best_tps  := array.new_float(lookback_trades, 1.0)
+    long_best_sls  := array.new_float(lookback_trades, 1.0)
+    short_best_tps := array.new_float(lookback_trades, 1.0)
+    short_best_sls := array.new_float(lookback_trades, 1.0)
+
+var int   last_total  = 0
+var float entry_price = na
+var float entry_atr   = na
+var int   trade_dir   = 0
+
+if total_trades > last_total
+    float move   = (not na(entry_atr) and entry_atr > 0) ? math.abs(close - entry_price) / entry_atr : 1.5
+    float new_tp = math.max(1.0, math.min(2.2, move))
+    float new_sl = math.max(1.0, math.min(3.0, move * 0.85))
+    if trade_dir == 1
+        array.push(long_best_tps, new_tp)
+        array.remove(long_best_tps, 0)
+        array.push(long_best_sls, new_sl)
+        array.remove(long_best_sls, 0)
+    else if trade_dir == -1
+        array.push(short_best_tps, new_tp)
+        array.remove(short_best_tps, 0)
+        array.push(short_best_sls, new_sl)
+        array.remove(short_best_sls, 0)
+    last_total := total_trades
+
+float long_learned_tp  = array_median(long_best_tps)
+float long_learned_sl  = array_median(long_best_sls)
+float short_learned_tp = array_median(short_best_tps)
+float short_learned_sl = array_median(short_best_sls)
+
+float max_bar_range_atr = trade_atr > 0
+     ? ta.highest(high - low, sl_bars_lookback) / trade_atr
+     : 1.0
+
+float long_adaptive_sl  = math.max(long_learned_sl,  max_bar_range_atr)
+float short_adaptive_sl = math.max(short_learned_sl, max_bar_range_atr)
+
+atr_sma = ta.sma(trade_atr, 100)
+float vol_adj = atr_sma > 0 ? math.max(0.5, math.min(2.0, trade_atr / atr_sma)) : 1.0
+
+float long_sugg_tp  = math.max(0.5, math.min(5.0, long_learned_tp   * vol_adj))
+float long_sugg_sl  = math.max(1.0, math.min(3.0, long_adaptive_sl  * vol_adj))
+float short_sugg_tp = math.max(0.5, math.min(5.0, short_learned_tp  * vol_adj))
+float short_sugg_sl = math.max(1.0, math.min(3.0, short_adaptive_sl * vol_adj))
+
+float sugg_tp  = in_long  ? long_sugg_tp  : in_short ? short_sugg_tp  : (long_sugg_tp  + short_sugg_tp)  / 2
+float sugg_sl  = in_long  ? long_sugg_sl  : in_short ? short_sugg_sl  : (long_sugg_sl  + short_sugg_sl)  / 2
+float sugg_lev = math.max(math.floor(math.min(target_risk_depo / math.max(sugg_sl, 0.1), max_allowed_lev)), 1.0)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 10. TRADE MANAGEMENT
+// ═════════════════════════════════════════════════════════════════════════════
+
+if buy and not in_long and not in_short
+    in_long       := true
+    long_entry    := close
+    fix_atr       := trade_atr
+    trade_tp_mult := use_auto_params ? long_sugg_tp : tp_mult
+    trade_sl_mult := use_auto_params ? long_sugg_sl : sl_mult
+    long_tp       := close + fix_atr * trade_tp_mult
+    long_sl       := close - fix_atr * trade_sl_mult
+    long_trail    := long_sl
+    entry_price   := close
+    entry_atr     := trade_atr
+    trade_dir     := 1
+
+else if in_long
+    if high >= long_tp
+        in_long      := false
+        total_trades += 1
+        win_trades   += 1
+    else
+        if use_trailing
+            long_trail := math.max(long_trail, close - fix_atr * trail_mult)
+        if low <= (use_trailing ? long_trail : long_sl)
+            in_long      := false
+            total_trades += 1
+            if (use_trailing ? long_trail : long_sl) >= long_entry
+                win_trades += 1
+
+if sell and not in_short and not in_long
+    in_short      := true
+    short_entry   := close
+    fix_atr       := trade_atr
+    trade_tp_mult := use_auto_params ? short_sugg_tp : tp_mult
+    trade_sl_mult := use_auto_params ? short_sugg_sl : sl_mult
+    short_tp      := close - fix_atr * trade_tp_mult
+    short_sl      := close + fix_atr * trade_sl_mult
+    short_trail   := short_sl
+    entry_price   := close
+    entry_atr     := trade_atr
+    trade_dir     := -1
+
+else if in_short
+    if low <= short_tp
+        in_short     := false
+        total_trades += 1
+        win_trades   += 1
+    else
+        if use_trailing
+            short_trail := math.min(short_trail, close + fix_atr * trail_mult)
+        if high >= (use_trailing ? short_trail : short_sl)
+            in_short     := false
+            total_trades += 1
+            if (use_trailing ? short_trail : short_sl) <= short_entry
+                win_trades += 1
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 11. VISUALS
+// ═════════════════════════════════════════════════════════════════════════════
+
+plotshape(buy,  title = "BUY",  text = "Buy",  style = shape.labelup,
+          location = location.belowbar, color = buy_col,  textcolor = color.white, size = size.tiny)
+plotshape(sell, title = "SELL", text = "Sell", style = shape.labeldown,
+          location = location.abovebar, color = sell_col, textcolor = color.white, size = size.tiny)
+
+long_tp_plot  = in_long  and show_sl_tp ? long_tp  : na
+short_tp_plot = in_short and show_sl_tp ? short_tp : na
+long_sl_plot  = in_long  and show_sl_tp ? long_sl  : na
+short_sl_plot = in_short and show_sl_tp ? short_sl : na
+
+plot(long_tp_plot,  "Long TP",  color = tp_col, style = plot.style_cross, linewidth = 2)
+plot(short_tp_plot, "Short TP", color = tp_col, style = plot.style_cross, linewidth = 2)
+plot(long_sl_plot,  "Long SL",  color = sl_col, style = plot.style_cross, linewidth = 1)
+plot(short_sl_plot, "Short SL", color = sl_col, style = plot.style_cross, linewidth = 1)
+
+plot(in_long  and use_trailing ? long_trail  : na, "L-Trail",
+     color = trail_col, style = plot.style_circles, linewidth = 1)
+plot(in_short and use_trailing ? short_trail : na, "S-Trail",
+     color = trail_col, style = plot.style_circles, linewidth = 1)
+
+// --- Bollinger Bands ---
+basis = ma(bb_src, bb_len, bb_maType)
+dev   = bb_mult * ta.stdev(bb_src, bb_len)
+upper = basis + dev
+lower = basis - dev
+
+plot(show_bb ? basis : na, "BB Basis", color = bb_basis_col, offset = bb_offset)
+bb_p1 = plot(show_bb ? upper : na, "BB Upper", color = bb_upper_col, offset = bb_offset)
+bb_p2 = plot(show_bb ? lower : na, "BB Lower", color = bb_lower_col, offset = bb_offset)
+fill(bb_p1, bb_p2, title = "BB Background", color = bb_fill_col)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 12. TABLE
+// ═════════════════════════════════════════════════════════════════════════════
+
+if show_table and barstate.islast
+    win_rate = total_trades > 0 ? (win_trades / total_trades) * 100 : 0.0
+
+    string filter_mode = use_st and use_chop ? "ST + CHOP" :
+                         use_st              ? "Supertrend" :
+                         use_chop            ? "CHOP" : "None"
+
+    tbl = table.new(tbl_pos, 2, 20,
+          bgcolor      = color.new(color.black, 70),
+          border_width = 1, border_color = color.gray,
+          frame_color  = color.gray, frame_width  = 1)
+
+    // MARKET
+    table.cell(tbl, 0, 0, "📊 MARKET",   text_color = #1b02fa,     text_size = size.small)
+    table.cell(tbl, 1, 0, "",            text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 0, 1, "Trend:",      text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 1, st_bullish ? "BULL 🟢" : "BEAR 🔴",
+               text_color = st_bullish ? color.lime : color.red,    text_size = size.small)
+    table.cell(tbl, 0, 2, "ATR:",        text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 2, str.tostring(trade_atr, "#.##"),
+               text_color = color.gray,  text_size = size.small)
+    table.cell(tbl, 0, 3, "CHOP:",       text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 3, str.tostring(ci, "#.#") + (chop_trend ? " 📈" : " 📊"),
+               text_color = chop_trend ? color.lime : color.orange,  text_size = size.small)
+    table.cell(tbl, 0, 4, "Filter:",     text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 4, filter_mode,   text_color = color.yellow, text_size = size.small)
+    // Показываем текущий адаптивный диапазон баров
+    table.cell(tbl, 0, 5, "Bar Range:",  text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 5, str.tostring(max_bar_range_atr, "#.##") + "x ATR",
+               text_color = max_bar_range_atr > long_learned_sl ? color.orange : color.gray,
+               text_size = size.small)
+
+    table.cell(tbl, 0, 6, "", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 6, "", text_color = color.gray, text_size = size.small)
+
+    // STATS
+    table.cell(tbl, 0, 7, "📈 STATS",    text_color = #1b02fa,     text_size = size.small)
+    table.cell(tbl, 1, 7, "",            text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 0, 8, "Win Rate:",   text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 8, str.tostring(win_rate, "#.#") + "%",
+               text_color = win_rate >= 50 ? color.lime : color.orange, text_size = size.small)
+    table.cell(tbl, 0, 9, "Trades:",     text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 9, str.tostring(win_trades) + " / " + str.tostring(total_trades),
+               text_color = color.white, text_size = size.small)
+
+    table.cell(tbl, 0, 10, "", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 10, "", text_color = color.gray, text_size = size.small)
+
+    // ADVISOR
+    string adv_dir = in_long  ? "🟢 LONG"  : in_short ? "🔴 SHORT" : "—"
+    color  adv_col = in_long  ? color.lime  : in_short ? color.red  : color.gray
+    table.cell(tbl, 0, 11, "🎯 ADVISOR",    text_color = #1b02fa,  text_size = size.small)
+    table.cell(tbl, 1, 11, adv_dir,         text_color = adv_col,  text_size = size.small)
+
+    table.cell(tbl, 0, 12, "L-TP learned:", text_color = color.lime, text_size = size.small)
+    table.cell(tbl, 1, 12, str.tostring(long_learned_tp,  "#.##") + "x", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 0, 13, "L-SL learned:", text_color = color.lime, text_size = size.small)
+    table.cell(tbl, 1, 13, str.tostring(long_learned_sl,  "#.##") + "x", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 0, 14, "S-TP learned:", text_color = color.red,  text_size = size.small)
+    table.cell(tbl, 1, 14, str.tostring(short_learned_tp, "#.##") + "x", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 0, 15, "S-SL learned:", text_color = color.red,  text_size = size.small)
+    table.cell(tbl, 1, 15, str.tostring(short_learned_sl, "#.##") + "x", text_color = color.gray, text_size = size.small)
+
+    table.cell(tbl, 0, 16, "", text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 1, 16, "", text_color = color.gray, text_size = size.small)
+
+    table.cell(tbl, 0, 17, "Suggest. TP:", text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 17, str.tostring(sugg_tp,  "#.##") + "x ATR", text_color = color.lime,   text_size = size.small)
+    table.cell(tbl, 0, 18, "Suggest. SL:", text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 18, str.tostring(sugg_sl,  "#.##") + "x ATR", text_color = color.orange, text_size = size.small)
+    table.cell(tbl, 0, 19, "Rec. Lev.:",   text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 19, "x" + str.tostring(sugg_lev, "#"),         text_color = color.yellow, text_size = size.small)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 13. ALERTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+alertcondition(buy,  title = "UT + ST + CHOP Long",  message = "🟢 BUY @ {{close}} | Enter next bar open")
+alertcondition(sell, title = "UT + ST + CHOP Short", message = "🔴 SELL @ {{close}} | Enter next bar open")
