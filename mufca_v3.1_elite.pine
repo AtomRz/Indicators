@@ -1,0 +1,1129 @@
+//@version=6
+indicator("MUFCA [AtomDC] v1.5 - Elite", overlay = true, max_labels_count = 500, max_bars_back = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. INPUTS
+// ═════════════════════════════════════════════════════════════════════════════
+sig_grp = "SIGNAL SOURCES"
+enable_a  = input.bool(true,  "Enable A Signals (Andean + MFI)",
+             tooltip = "Enables type A signals — a combination of the Andean oscillator and MFI with clustering. Less frequent but more precise entries.",
+             group = sig_grp)
+enable_u  = input.bool(true,  "Enable U Signals (UT Bot)",
+             tooltip = "Enables type U signals — ATR trailing stop UT Bot. More frequent entries, reacts faster to reversals.",
+             group = sig_grp)
+
+filter_grp = "FILTER MODE"
+use_frama_filter = input.bool(true,  "Use FRAMA Filter",
+                   tooltip = "Allows entries only in the direction of the FRAMA trend. Recommended to keep enabled at all times.",
+                   group = filter_grp)
+use_chop         = input.bool(true,  "Use CHOP Filter",
+                   tooltip = "Blocks signals during sideways market based on the CHOP volatility index. Orange background = sideways market.",
+                   group = filter_grp)
+use_atr_f        = input.bool(true,  "Use ATR Filter",
+                   tooltip = "Filters out markets that are too quiet or too chaotic. Set the acceptable ATR% range below.",
+                   group = filter_grp)
+atr_period       = input.int(14,     "ATR Period",
+                   tooltip = "ATR period for the volatility filter. Standard is 14.",
+                   group = filter_grp)
+atr_min          = input.float(0.3,  "Min ATR %",
+                   tooltip = "Minimum volatility as a % of price. Below this — market is too sluggish, signals are unreliable.",
+                   group = filter_grp)
+atr_max          = input.float(4.5,  "Max ATR %",
+                   tooltip = "Maximum volatility as a % of price. Above this — market is chaotic (news, pump), trading is risky.",
+                   group = filter_grp)
+
+ai_pro_grp = "AI PRO"
+
+htf                 = input.timeframe("D", "HTF Bias TF",
+                      tooltip = "Timeframe for the HTF filter. Default is daily. Can be set to W for weekly.",
+                      group = ai_pro_grp)
+cooldown_bars       = input.int(2,      "Signal Cooldown",
+                      minval = 0,
+                      tooltip = "Minimum number of bars between two signals of the same track. Protection against excessive consecutive entries.",
+                      group = ai_pro_grp)
+enable_ai_regime    = input.bool(true,  "AI Volatility Regime",
+                      tooltip = "Determines the market regime (CHAOS/TREND/NORMAL) based on ATR and automatically adjusts the recommended leverage.",
+                      group = ai_pro_grp)
+enable_fake_break   = input.bool(true,  "Fake Breakout Filter",
+                      tooltip = "Blocks signals if price broke through an extreme but closed back — a sign of a false breakout.",
+                      group = ai_pro_grp)
+enable_liq_sweep    = input.bool(true,  "Liquidity Sweep Filter",
+                      tooltip = "Blocks counter-directional signals after a liquidity sweep (stop hunt with reversal).",
+                      group = ai_pro_grp)
+enable_partial_tp   = input.bool(true,  "Smart Partial TP",
+                      tooltip = "When 50% of TP is reached, recommends closing part of the position. Displayed in the table.",
+                      group = ai_pro_grp)
+enable_mtf_bias     = input.bool(true,  "Enable HTF Bias",
+                      tooltip = "Filter based on the higher timeframe (HTF) trend. Longs — only in HTF bullish market, shorts — only in bearish.",
+                      group = ai_pro_grp)
+enable_adaptive_lev = input.bool(true,  "Adaptive Leverage",
+                      tooltip = "Automatically reduces recommended leverage in CHAOS mode and increases it in TREND mode.",
+                      group = ai_pro_grp)
+                      
+a_grp = "ANDEAN + MFI"
+mfi_len      = input.int(8,    "MFI Length",
+               tooltip = "MFI (Money Flow Index) period. Lower — reacts faster, more noise. Recommended: 5–10.",
+               group = a_grp)
+mfi_training = input.int(800,  "AI Training Size",
+               tooltip = "Number of historical bars for training K-means clustering of MFI levels. More = more accurate, but slower.",
+               group = a_grp)
+and_len      = input.int(23,   "Andean Length",
+               tooltip = "Andean oscillator period. Higher — slower and fewer signals, but more reliable.",
+               group = a_grp)
+and_sig_len  = input.int(6,    "Andean Signal Smoothing",
+               tooltip = "Smoothing of the Andean signal line. Increase to remove false crossovers.",
+               group = a_grp)
+lookback     = input.int(3,    "Confirmation Window",
+               tooltip = "Confirmation window: MFI and Andean must give a signal within N bars of each other.",
+               group = a_grp)
+
+ut_grp = "UT BOT"
+ut_a = input.float(1.0,  "Key Value (Sensitivity)",
+        tooltip = "UT Bot sensitivity. Lower — more signals but more noise. Higher — fewer but more reliable.",
+        group = ut_grp)
+ut_c = input.int(10,     "ATR Period",
+        tooltip = "ATR period for UT Bot trailing stop calculation. Standard is 10.",
+        group = ut_grp)
+ut_h = input.bool(false, "Heikin Ashi Candles",
+        tooltip = "Calculate UT Bot on Heikin Ashi candles instead of regular. Smooths out noise but adds slight lag.",
+        group = ut_grp)
+
+frama_grp = "FRAMA CHANNEL"
+frama_len  = input.int(22,   "FRAMA Period (Even value)",
+             minval = 4, maxval = 100, step = 2,
+             tooltip = "FRAMA (Fractal Adaptive Moving Average) period. Must be even. 26 — a balance between speed and stability.",
+             group = frama_grp)
+frama_mult = input.float(2.1, "Channel Multiplier",
+             minval = 0.1, step = 0.1,
+             tooltip = "FRAMA channel width in ATR. Increase for noisy instruments, decrease for calm ones.",
+             group = frama_grp)
+show_frama = input.bool(true, "Show FRAMA Lines",
+             tooltip = "Show FRAMA channel lines on the chart.",
+             group = frama_grp)
+f_up_col   = input.color(color.rgb(0, 255, 120),  "FRAMA Up Color",  group = frama_grp)
+f_dn_col   = input.color(color.rgb(255, 50, 50),  "FRAMA Down Color", group = frama_grp)
+
+chop_grp = "CHOP FILTER"
+chop_length    = input.int(14,   "CHOP Length",
+                 minval = 1,
+                 tooltip = "Period for CHOP index calculation. Standard is 14.",
+                 group = chop_grp)
+chop_threshold = input.float(61.8, "CHOP Threshold",
+                 minval = 1.0, maxval = 100.0, step = 0.1,
+                 tooltip = "CHOP threshold value. Above the threshold — sideways market (trading blocked). 61.8 — golden ratio.",
+                 group = chop_grp)
+show_chop_bg   = input.bool(true, "Show CHOP Background",
+                 tooltip = "Show orange background during sideways market periods.",
+                 group = chop_grp)
+
+adv_grp = "ADVISOR (TP LEARNING)"
+max_allowed_lev  = input.int(10,   "Max Leverage (Limit)",
+                   minval = 1, maxval = 100,
+                   tooltip = "Maximum leverage the advisor can recommend. Safety limit.",
+                   group = adv_grp)
+target_risk_depo = input.float(5.0, "SL Risk (%)",
+                   minval = 1.0, maxval = 20.0,
+                   tooltip = "Acceptable risk per trade as a % of deposit. Used to calculate recommended leverage.",
+                   group = adv_grp)
+lookback_trades  = input.int(25,   "Trades for Learning",
+                   minval = 2, maxval = 100,
+                   tooltip = "Number of recent trades for advisor self-learning (median TP calculation).",
+                   group = adv_grp)
+
+trade_sett_grp = "TRADE SETTINGS"
+use_auto_params = input.bool(true,  "Use Advisor Auto TP/SL",
+                  tooltip = "Use the TP calculated by the advisor based on history. If disabled — a fixed multiplier below is used.",
+                  group = trade_sett_grp)
+tp_mult         = input.float(1.0,  "Fixed Take Profit (xATR)",
+                  tooltip = "Fixed TP in ATR. Used only if 'Advisor Auto TP/SL' is disabled.",
+                  group = trade_sett_grp)
+sl_mult         = input.float(1.0,  "Fixed Stop Loss (xATR)",
+                  tooltip = "Fixed SL in ATR. Used only if 'Advisor Auto TP/SL' is disabled.",
+                  group = trade_sett_grp)
+use_trailing    = input.bool(false, "Enable Trailing Stop",
+                  tooltip = "Enable trailing stop instead of fixed SL. Stop follows price by ATR.",
+                  group = trade_sett_grp)
+trail_mult      = input.float(1.8,  "Trailing Stop ATR Multiplier",
+                  tooltip = "Trailing stop distance from price in ATR. Higher — stop is further away, position lives longer.",
+                  group = trade_sett_grp)
+max_bars_hold   = input.int(25,     "Max Bars to Hold Position",
+                  minval = 1, maxval = 500,
+                  tooltip = "Force-close position after N bars if TP or SL has not been triggered. Protection against stuck trades.",
+                  group = trade_sett_grp)
+
+visual_grp = "VISUALS"
+show_sl_tp = input.bool(true,  "Show SL/TP Lines",
+             tooltip = "Show horizontal TP and SL lines on the chart.",
+             group = visual_grp)
+show_table = input.bool(true,  "Show Table",
+             tooltip = "Show information table with track metrics and advisor data.",
+             group = visual_grp)
+table_pos  = input.string("Top Right", "Table Position",
+             options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"],
+             group = visual_grp)
+a_buy_col  = input.color(color.new(color.teal,   20), "A Buy",  group = visual_grp, inline = "acol")
+a_sell_col = input.color(color.new(color.maroon, 20), "A Sell", group = visual_grp, inline = "acol")
+u_buy_col  = input.color(color.green,  "U Buy",  group = visual_grp, inline = "acol")
+u_sell_col = input.color(color.red,    "U Sell", group = visual_grp, inline = "acol")
+u_tp_col   = input.color(color.lime,   "U TP",   group = visual_grp, inline = "tpsl")
+a_tp_col   = input.color(color.teal,   "A TP",   group = visual_grp, inline = "tpsl")
+sl_col     = input.color(color.red,    "SL Line", group = visual_grp, inline = "tpsl")
+trail_col  = input.color(color.yellow, "Trail",   group = visual_grp, inline ="tpsl")
+
+bb_grp = "BOLLINGER BANDS"
+show_bb      = input.bool(true,   "Show Bollinger Bands", group = bb_grp)
+bb_len       = input.int(20,      "Length", minval = 1, group = bb_grp)
+bb_maType    = input.string("SMA","Basis MA Type",
+               options = ["SMA","EMA","SMMA (RMA)","WMA","VWMA"], group = bb_grp)
+bb_src       = input.source(close,"Source", group = bb_grp)
+bb_mult      = input.float(2.0,   "StdDev", minval = 0.001, maxval = 50, step = 0.5, group = bb_grp)
+bb_offset    = input.int(0,       "Offset", minval = -500, maxval = 500, group = bb_grp)
+bb_basis_col = input.color(color.rgb(255,100,15),     "Basis", group = bb_grp, inline = "bbcol")
+bb_upper_col = input.color(color.rgb(55,55,255),      "Upper", group = bb_grp, inline = "bbcol")
+bb_lower_col = input.color(color.rgb(55,55,255),      "Lower", group = bb_grp, inline = "bbcol")
+bb_fill_col  = input.color(color.rgb(33,150,243, 95), "Fill",  group = bb_grp, inline = "bbcol")
+
+sr_grp = "S&R POWER CHANNEL"
+show_sr       = input.bool(true,  "Show S&R Channel",
+                tooltip = "Show support and resistance channel with bull/bear power indicator.",
+                group = sr_grp)
+sr_length     = input.int(90,    "Lookback Length",  group = sr_grp, minval = 10)
+sr_extend     = input.int(20,     "Extend Bars",      group = sr_grp, minval = 20, maxval = 100)
+sr_top_col    = input.color(color.new(#cfcfcf, 85), "Res. Color",  group = sr_grp, inline = "srcol")
+sr_bot_col    = input.color(color.new(#0ddcfc, 85), "Sup. Color",  group = sr_grp, inline = "srcol")
+sr_sigtop_col = input.color(color.new(#eeefef, 23), "Res. Signal", group = sr_grp, inline = "srcol")
+sr_sigbot_col = input.color(color.new(#05deff, 23), "Sup. Signal", group = sr_grp, inline = "srcol")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+get_pos(pos_str) =>
+    switch pos_str
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+tbl_pos = get_pos(table_pos)
+
+ma(source, length, _type) =>
+    switch _type
+        "SMA"         => ta.sma(source, length)
+        "EMA"         => ta.ema(source, length)
+        "SMMA (RMA)"  => ta.rma(source, length)
+        "WMA"         => ta.wma(source, length)
+        "VWMA"        => ta.vwma(source, length)
+        => ta.sma(source, length)
+
+array_median(float[] arr) =>
+    float result = na
+    int sz = array.size(arr)
+    if sz > 0
+        float[] s = array.copy(arr)
+        array.sort(s, order.ascending)
+        result := sz % 2 == 1 ? array.get(s, sz / 2) : (array.get(s, sz / 2 - 1) + array.get(s, sz / 2)) / 2.0
+    result
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. S&R POWER CHANNEL
+// ═════════════════════════════════════════════════════════════════════════════
+type data
+	line sup = na
+	line res = na
+	box sup_area = na
+	box res_area = na
+
+// --------------------------------------------------------------------------------------------------------------------}
+// INDICATOR CALCULATIONS
+// --------------------------------------------------------------------------------------------------------------------{
+
+max_min(length, d) =>
+    var max = array.new<float>(length)
+    var min = array.new<float>(length)
+
+    if barstate.islast
+        for i = 0 to length - 1 by 1
+            max.set(i, high[i])
+            min.set(i, low[i])
+
+
+        float max_ = max.max()
+        float min_ = min.min()
+        float mid_ = math.avg(max_, min_)
+
+        label.delete(label.new(bar_index + sr_extend + 15, max_, str.tostring(max_, '🡅 #.##'), color = color(na), style = label.style_label_center, textcolor = chart.fg_color)[1])
+        label.delete(label.new(bar_index + sr_extend + 15, min_, str.tostring(min_, '🡇 #.##'), color = color(na), style = label.style_label_center, textcolor = chart.fg_color)[1])
+        label.delete(label.new(bar_index + sr_extend, mid_, str.tostring(mid_, '🡆 #.##'), color = color(na), style = label.style_label_left, textcolor = color.gray)[1])
+        line.delete(line.new(bar_index - sr_length, mid_, bar_index + sr_extend, mid_, color = color.gray, style = line.style_dotted)[1])
+
+        index_of_max = max.indexof(max_)
+        index_of_min = min.indexof(min_)
+
+        label.delete(label.new(bar_index[index_of_max], max_, '✖', color = color(na), textcolor = color.new(sr_top_col,0), size = size.normal, style = label.style_label_center)[1])
+        label.delete(label.new(bar_index[index_of_min], min_, '✖', color = color(na), textcolor = color.new(sr_bot_col,0), size = size.normal, style = label.style_label_center)[1])
+    [max.max(), min.min()]
+
+
+delte_(data d) =>
+    field_0 = d.sup
+    line.delete(field_0[1])
+    field_1 = d.res
+    line.delete(field_1[1])
+    field_2 = d.sup_area
+    box.delete(field_2[1])
+    field_3 = d.res_area
+    box.delete(field_3[1])
+
+power(d) =>
+    int buy = 0
+    int sell = 0
+
+    if barstate.islast
+        for i = 0 to sr_length - 1 by 1
+            buy := buy + (close[i] > open[i] ? 1 : 0)
+            sell := sell + (close[i] < open[i] ? 1 : 0)
+
+    d.sup_area.set_text(str.tostring(buy, '            Buy Power: #'))
+    d.res_area.set_text(str.tostring(sell, '            Sell Power: #'))
+
+    d.res_area.set_text_color(chart.fg_color)
+    d.sup_area.set_text_color(chart.fg_color)
+    d.res_area.set_text_halign(text.align_left)
+    d.sup_area.set_text_halign(text.align_left)
+    d.res_area.set_text_size(size.normal)
+    d.sup_area.set_text_size(size.normal)
+
+
+signals(d) =>
+    if barstate.islast
+        for i = 0 to sr_length - 1 by 1
+
+            low_1 = low[i]
+            low_2 = low[i > 0 ? i + 1 : i]
+
+            high_1 = high[i]
+            high_2 = high[i > 0 ? i + 1 : i]
+
+            index = bar_index - i
+            top = d.sup_area.get_top()
+            bot = d.res_area.get_bottom()
+
+            if low_1 > top and low_2 <= top
+                label.new(index, low_2, '◈',textcolor = color.new(sr_bot_col, 0), color = color(na), style = label.style_label_up, size = size.large)
+
+            if high_1 < bot and high_2 >= bot
+                label.new(index, high_2, '◈', textcolor = color.new(sr_top_col,0), color = color(na), style = label.style_label_down, size = size.large)
+
+run_indicator() =>
+    float atr = ta.atr(200) * 0.5
+    var data d = data.new(line(na), line(na), box(na), box(na))
+
+    [max, min] = max_min(sr_length, d)
+    if barstate.islast
+        d.sup := line.new(bar_index - sr_length, max + atr, bar_index + sr_extend + 30, max + atr, color = sr_top_col, style = line.style_solid)
+        d.res := line.new(bar_index - sr_length, min - atr, bar_index + sr_extend + 30, min - atr, color = sr_bot_col, style = line.style_solid)
+
+        d.res_area := box.new(bar_index - sr_length, max + atr, bar_index + sr_extend, max - atr, na, bgcolor = color.new(sr_top_col, 80))
+        d.sup_area := box.new(bar_index - sr_length, min + atr, bar_index + sr_extend, min - atr, na, bgcolor = color.new(sr_bot_col, 80))
+
+    delte_(d)
+    signals(d)
+    power(d)
+
+
+// --------------------------------------------------------------------------------------------------------------------}
+// VISUALIZATION
+// --------------------------------------------------------------------------------------------------------------------{
+if show_sr
+    run_indicator()
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. ANDEAN + MFI
+// ═════════════════════════════════════════════════════════════════════════════
+osc_mfi = ta.mfi(hlc3, mfi_len)
+
+kmeans_clustering(src, training_len) =>
+    safe_len  = math.min(training_len, bar_index)
+    values    = array.new_float(0)
+    for i = 0 to safe_len
+        v = src[i]
+        if not na(v)
+            array.push(values, v)
+    size_vals = array.size(values)
+    if size_vals < 2
+        avg = size_vals > 0 ? array.avg(values) : 50.0
+        [avg, avg]
+    else
+        c1 = array.min(values)
+        c2 = array.max(values)
+        for _k = 0 to 9
+            cl1 = array.new_float(0)
+            cl2 = array.new_float(0)
+            for i = 0 to size_vals - 1
+                v = array.get(values, i)
+                if math.abs(v - c1) < math.abs(v - c2)
+                    array.push(cl1, v)
+                else
+                    array.push(cl2, v)
+            c1 := array.size(cl1) > 0 ? array.avg(cl1) : c1
+            c2 := array.size(cl2) > 0 ? array.avg(cl2) : c2
+        [c1, c2]
+
+var bool  kmeans_ready = false
+var float level_os     = na
+var float level_ob     = na
+recalc_kmeans = barstate.isconfirmed and bar_index % 5 == 0
+
+if recalc_kmeans or bar_index == 0
+    if bar_index >= math.min(mfi_training, 10) and not na(osc_mfi)
+        [c1, c2] = kmeans_clustering(osc_mfi, mfi_training)
+        level_os := math.min(c1, c2)
+        level_ob := math.max(c1, c2)
+        kmeans_ready := true
+
+alpha = 2.0 / (and_len + 1)
+var float upper_ema1 = na
+var float upper_ema2 = na
+var float lower_ema1 = na
+var float lower_ema2 = na
+
+upper_ema1 := nz(math.max(close, open, upper_ema1 - (upper_ema1 - close) * alpha), close)
+upper_ema2 := nz(math.max(close * close, open * open, upper_ema2 - (upper_ema2 - close * close) * alpha), close * close)
+lower_ema1 := nz(math.min(close, open, lower_ema1 + (close - lower_ema1) * alpha), close)
+lower_ema2 := nz(math.min(close * close, open * open, lower_ema2 + (close * close - lower_ema2) * alpha), close * close)
+
+and_osc = math.sqrt(math.max(0, lower_ema2 - lower_ema1 * lower_ema1)) -
+          math.sqrt(math.max(0, upper_ema2 - upper_ema1 * upper_ema1))
+and_sig = ta.ema(and_osc, and_sig_len)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. UT BOT (ИСПРАВЛЕННЫЙ — только UT фиксируется на закрытии бара)
+// ═════════════════════════════════════════════════════════════════════════════
+ut_src = close
+if ut_h
+    ha_ticker = ticker.heikinashi(syminfo.tickerid)
+    ut_src := request.security(ha_ticker, timeframe.period, close,
+              gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+ut_xATR  = ta.atr(ut_c)
+ut_nLoss = ut_a * ut_xATR
+
+var float xATRTrailingStop = 0.0
+float prev_stop = nz(xATRTrailingStop[1])
+xATRTrailingStop := ut_src > prev_stop and ut_src[1] > prev_stop ? math.max(prev_stop, ut_src - ut_nLoss) :
+                     ut_src < prev_stop and ut_src[1] < prev_stop ? math.min(prev_stop, ut_src + ut_nLoss) :
+                     ut_src > prev_stop ? ut_src - ut_nLoss : ut_src + ut_nLoss
+
+// ИСПРАВЛЕНИЕ: фиксируем пересечение ТОЛЬКО на закрытии бара
+bool ut_above    = barstate.isconfirmed and ta.crossover(ut_src,  xATRTrailingStop)
+bool ut_below    = barstate.isconfirmed and ta.crossunder(ut_src, xATRTrailingStop)
+bool ut_buy_raw  = barstate.isconfirmed and ut_src > xATRTrailingStop and ut_above
+bool ut_sell_raw = barstate.isconfirmed and ut_src < xATRTrailingStop and ut_below
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. FRAMA CHANNEL + FILTERS (ВОЗВРАТ к оригиналу — A-сигналы не сдвигаются)
+// ═════════════════════════════════════════════════════════════════════════════
+int n = frama_len / 2
+float hh1 = ta.highest(high, n)
+float ll1  = ta.lowest(low,  n)
+float n1   = (hh1 - ll1) / n
+float hh2  = ta.highest(high, n)[n]
+float ll2  = ta.lowest(low,  n)[n]
+float n2   = (hh2 - ll2) / n
+float hh3  = ta.highest(high, frama_len)
+float ll3  = ta.lowest(low,  frama_len)
+float n3   = (hh3 - ll3) / frama_len
+
+float dimen = 0.0
+if n1 > 0 and n2 > 0 and n3 > 0
+    dimen := (math.log(n1 + n2) - math.log(n3)) / math.log(2.0)
+
+float alpha_frama = math.max(0.01, math.min(1.0, math.exp(-4.6 * (dimen - 1.0))))
+
+var float frama_ma = na
+frama_ma := na(frama_ma) ? close : alpha_frama * close + (1.0 - alpha_frama) * nz(frama_ma[1])
+
+// FIX #15: safe ATR with na-guard
+float safe_atr14_raw = ta.atr(14)
+float safe_atr14     = nz(safe_atr14_raw, close * 0.01)
+
+float trade_atr = ta.atr(atr_period)
+float atr14     = safe_atr14
+float atr_pct   = nz(trade_atr, close * 0.01) / close * 100
+bool  atr_ok    = use_atr_f ? (atr_pct >= atr_min and atr_pct <= atr_max) : true
+
+float frama_atr   = nz(ta.atr(frama_len), close * 0.01)
+float frama_upper = frama_ma + frama_atr * frama_mult
+float frama_lower = frama_ma - frama_atr * frama_mult
+
+var int frama_dir = 0
+// ВОЗВРАТ к оригиналу: используем close как было
+if close > frama_upper
+    frama_dir := 1
+else if close < frama_lower
+    frama_dir := -1
+
+bool frama_bullish = frama_dir == 1
+bool frama_bearish = frama_dir == -1
+
+plot(show_frama ? frama_ma : na, "FRAMA Mid",
+     color = frama_bullish ? f_up_col : frama_bearish ? f_dn_col : color.gray,
+     linewidth = 2, display = display.all - display.price_scale - display.status_line)
+p_f_upper = plot(show_frama ? frama_upper : na, "FRAMA Upper", color = color.new(f_up_col, 40),
+                 display = display.all - display.price_scale - display.status_line)
+p_f_lower = plot(show_frama ? frama_lower : na, "FRAMA Lower", color = color.new(f_dn_col, 40),
+                 display = display.all - display.price_scale - display.status_line)
+fill(p_f_upper, p_f_lower,
+     color = frama_bullish ? color.new(f_up_col, 95) : frama_bearish ? color.new(f_dn_col, 95) : color.new(color.gray, 95),
+     title = "FRAMA Channel BG")
+
+ci         = 100 * math.log10(math.sum(ta.atr(1), chop_length) /
+             math.max(ta.highest(chop_length) - ta.lowest(chop_length), 0.000001)) / math.log10(chop_length)
+chop_trend = ci < chop_threshold
+bgcolor(show_chop_bg and not chop_trend ? color.new(color.orange, 90) : na, title = "CHOP Sideways BG")
+
+// ВОЗВРАТ к оригиналу: фильтры как были
+frama_ok_long  = use_frama_filter ? frama_bullish : true
+frama_ok_short = use_frama_filter ? frama_bearish : true
+chop_ok        = use_chop ? chop_trend : true
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. AI PRO ENGINE (ВОЗВРАТ к оригиналу — A-сигналы не сдвигаются)
+// ═════════════════════════════════════════════════════════════════════════════
+
+htf_frama = request.security(syminfo.tickerid, htf, frama_ma,
+             gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+htf_close = request.security(syminfo.tickerid, htf, close,
+             gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+// ВОЗВРАТ к оригиналу: HTF bias как было
+htf_bull  = htf_close > htf_frama
+htf_bear  = htf_close < htf_frama
+
+// ВОЗВРАТ к оригиналу: slope как было
+frama_slope          = frama_ma - nz(frama_ma[1])
+frama_slope_ok_long  = frama_slope > 0
+frama_slope_ok_short = frama_slope < 0
+
+// ВОЗВРАТ к оригиналу: fake breakout как было
+fake_break_long  = high > ta.highest(high, 10)[1] and close < ta.highest(high, 10)[1]
+fake_break_short = low < ta.lowest(low, 10)[1] and close > ta.lowest(low, 10)[1]
+
+// ВОЗВРАТ к оригиналу: liquidity sweep как было
+liq_sweep_long  = low < ta.lowest(low, 5)[1] and close > ta.lowest(low, 5)[1] and close > open
+liq_sweep_short = high > ta.highest(high, 5)[1] and close < ta.highest(high, 5)[1] and close < open
+
+atr_regime = atr_pct > atr_max ? "CHAOS" : atr_pct > (atr_min * 1.5) ? "TREND" : "NORMAL"
+
+// FIX #10: separate long/short cooldown per track
+var int last_a_long_bar  = na
+var int last_a_short_bar = na
+var int last_u_long_bar  = na
+var int last_u_short_bar = na
+
+a_long_cooldown_ok  = na(last_a_long_bar)  or (bar_index - last_a_long_bar  > cooldown_bars)
+a_short_cooldown_ok = na(last_a_short_bar) or (bar_index - last_a_short_bar > cooldown_bars)
+u_long_cooldown_ok  = na(last_u_long_bar)  or (bar_index - last_u_long_bar  > cooldown_bars)
+u_short_cooldown_ok = na(last_u_short_bar) or (bar_index - last_u_short_bar > cooldown_bars)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. TRADE FILTERS
+// ═════════════════════════════════════════════════════════════════════════════
+filter_long = frama_ok_long and chop_ok and atr_ok and frama_slope_ok_long and
+              (not enable_mtf_bias or htf_bull) and
+              (not enable_fake_break or not fake_break_long) and
+              (not enable_liq_sweep or not liq_sweep_short)
+
+filter_short = frama_ok_short and chop_ok and atr_ok and frama_slope_ok_short and
+               (not enable_mtf_bias or htf_bear) and
+               (not enable_fake_break or not fake_break_short) and
+               (not enable_liq_sweep or not liq_sweep_long)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 9. RAW SIGNALS
+// ═════════════════════════════════════════════════════════════════════════════
+bool warmed_up = bar_index >= mfi_training
+
+bool levels_ready = kmeans_ready and not na(level_os) and not na(level_ob)
+
+mfi_bull_sig = ta.crossover(osc_mfi,  level_os) and barstate.isconfirmed and levels_ready
+mfi_bear_sig = ta.crossunder(osc_mfi, level_ob) and barstate.isconfirmed and levels_ready
+and_bull_sig = ta.crossover(and_osc,  and_sig)  and barstate.isconfirmed and levels_ready
+and_bear_sig = ta.crossunder(and_osc, and_sig)  and barstate.isconfirmed and levels_ready
+
+int bs_and_bull = ta.barssince(and_bull_sig)
+int bs_mfi_bull = ta.barssince(mfi_bull_sig)
+int bs_and_bear = ta.barssince(and_bear_sig)
+int bs_mfi_bear = ta.barssince(mfi_bear_sig)
+
+confirm_long_a  = (mfi_bull_sig and not na(bs_and_bull) and bs_and_bull <= lookback) or
+                  (and_bull_sig and not na(bs_mfi_bull) and bs_mfi_bull <= lookback)
+confirm_short_a = (mfi_bear_sig and not na(bs_and_bear) and bs_and_bear <= lookback) or
+                  (and_bear_sig and not na(bs_mfi_bear) and bs_mfi_bear <= lookback)
+
+a_long_raw  = confirm_long_a  and warmed_up and filter_long
+a_short_raw = confirm_short_a and warmed_up and filter_short
+// ИСПРАВЛЕНИЕ: U сигналы уже зафиксированы на закрытии бара в секции 5
+u_long_raw  = ut_buy_raw  and filter_long
+u_short_raw = ut_sell_raw and filter_short
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 10. DUAL TRACK STATE
+// ═════════════════════════════════════════════════════════════════════════════
+
+// --- A TRACK ---
+var float a_long_entry  = na
+var float a_long_tp     = na
+var float a_long_sl     = na
+var float a_long_trail  = na
+var bool  a_in_long     = false
+var int   a_long_bar    = 0
+var float a_short_entry = na
+var float a_short_tp    = na
+var float a_short_sl    = na
+var float a_short_trail = na
+var bool  a_in_short    = false
+var int   a_short_bar   = 0
+var int   a_total       = 0
+var int   a_wins        = 0
+var float a_fix_atr     = na
+
+// --- U TRACK ---
+var float u_long_entry  = na
+var float u_long_tp     = na
+var float u_long_sl     = na
+var float u_long_trail  = na
+var bool  u_in_long     = false
+var int   u_long_bar    = 0
+var float u_short_entry = na
+var float u_short_tp    = na
+var float u_short_sl    = na
+var float u_short_trail = na
+var bool  u_in_short    = false
+var int   u_short_bar   = 0
+var int   u_total       = 0
+var int   u_wins        = 0
+var float u_fix_atr     = na
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 11. SELF-LEARNING ADVISOR
+// ═════════════════════════════════════════════════════════════════════════════
+var float[] a_long_tps  = na
+var float[] a_short_tps = na
+var float[] u_long_tps  = na
+var float[] u_short_tps = na
+
+if bar_index == 0
+    a_long_tps  := array.new_float(lookback_trades, 1.5)
+    a_short_tps := array.new_float(lookback_trades, 1.5)
+    u_long_tps  := array.new_float(lookback_trades, 1.5)
+    u_short_tps := array.new_float(lookback_trades, 1.5)
+
+var int   a_last_total  = 0
+var float a_entry_price = na
+var float a_entry_atr   = na
+var int   a_trade_dir   = 0
+var float a_exit_price  = na
+
+var int   u_last_total  = 0
+var float u_entry_price = na
+var float u_entry_atr   = na
+var int   u_trade_dir   = 0
+var float u_exit_price  = na
+
+if a_total > a_last_total
+    float move = (not na(a_entry_atr) and a_entry_atr > 0 and not na(a_exit_price)) ?
+                  math.abs(a_exit_price - a_entry_price) / a_entry_atr : 1.5
+    float new_tp = math.max(1.0, math.min(3.5, move))
+    if a_trade_dir == 1
+        array.push(a_long_tps, new_tp)
+        array.remove(a_long_tps, 0)
+    else if a_trade_dir == -1
+        array.push(a_short_tps, new_tp)
+        array.remove(a_short_tps, 0)
+    a_last_total := a_total
+
+// Learning U track
+if u_total > u_last_total
+    float move = (not na(u_entry_atr) and u_entry_atr > 0 and not na(u_exit_price)) ?
+                  math.abs(u_exit_price - u_entry_price) / u_entry_atr : 1.5
+    float new_tp = math.max(1.0, math.min(3.5, move))
+    if u_trade_dir == 1
+        array.push(u_long_tps, new_tp)
+        array.remove(u_long_tps, 0)
+    else if u_trade_dir == -1
+        array.push(u_short_tps, new_tp)
+        array.remove(u_short_tps, 0)
+    u_last_total := u_total
+
+float a_l_tp = array_median(a_long_tps)
+float a_s_tp = array_median(a_short_tps)
+float u_l_tp = array_median(u_long_tps)
+float u_s_tp = array_median(u_short_tps)
+
+atr_sma = ta.sma(atr14, 100)
+float vol_adj = atr_sma > 0 ? math.max(0.5, math.min(2.0, atr14 / atr_sma)) : 1.0
+
+float long_sugg_tp  = math.max(0.5, math.min(3.0, a_l_tp * vol_adj))
+float short_sugg_tp = math.max(0.5, math.min(3.0, a_s_tp * vol_adj))
+float u_long_sugg   = math.max(0.5, math.min(3.0, u_l_tp * vol_adj))
+float u_short_sugg  = math.max(0.5, math.min(3.0, u_s_tp * vol_adj))
+
+float safe_atr = math.max(atr14, 0.000001)
+float frama_sl_long  = math.max(1.0, math.min(3.5, math.abs(close - frama_lower) / safe_atr))
+float frama_sl_short = math.max(1.0, math.min(3.5, math.abs(frama_upper - close) / safe_atr))
+
+float a_sugg_tp = a_in_long  ? long_sugg_tp  : a_in_short ? short_sugg_tp : (long_sugg_tp + short_sugg_tp) / 2
+float u_sugg_tp = u_in_long  ? u_long_sugg   : u_in_short ? u_short_sugg  : (u_long_sugg  + u_short_sugg)  / 2
+float sugg_sl   = a_in_long  or u_in_long  ? frama_sl_long  :
+                  a_in_short or u_in_short ? frama_sl_short :
+                  (frama_sl_long + frama_sl_short) / 2
+float sugg_lev  = math.max(math.floor(math.min(target_risk_depo / math.max(sugg_sl, 0.1), max_allowed_lev)), 1.0)
+
+if enable_adaptive_lev and enable_ai_regime
+    if atr_regime == "CHAOS"
+        sugg_lev := math.max(1, math.floor(sugg_lev * 0.5))
+    else if atr_regime == "TREND"
+        sugg_lev := math.min(max_allowed_lev, math.floor(sugg_lev * 1.2))
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 12. SIGNAL CLASSIFICATION
+// ═════════════════════════════════════════════════════════════════════════════
+bool active_a_long  = enable_a ? a_long_raw  : false
+bool active_a_short = enable_a ? a_short_raw : false
+bool active_u_long  = enable_u ? u_long_raw  : false
+bool active_u_short = enable_u ? u_short_raw : false
+
+bool sig_a_long  = enable_a and active_a_long  and not a_in_long  and not a_in_short and a_long_cooldown_ok  and barstate.isconfirmed
+bool sig_a_short = enable_a and active_a_short and not a_in_short and not a_in_long  and a_short_cooldown_ok and barstate.isconfirmed
+bool sig_u_long  = enable_u and active_u_long  and not u_in_long  and not u_in_short and u_long_cooldown_ok  and barstate.isconfirmed
+bool sig_u_short = enable_u and active_u_short and not u_in_short and not u_in_long  and u_short_cooldown_ok and barstate.isconfirmed
+
+bool any_long_signal  = sig_a_long  or sig_u_long
+bool any_short_signal = sig_a_short or sig_u_short
+
+float ai_confidence_long  = 0.0
+float ai_confidence_short = 0.0
+
+// Long confidence
+ai_confidence_long += chop_trend           ? 20 : 0
+ai_confidence_long += atr_ok               ? 20 : 0
+ai_confidence_long += frama_bullish        ? 15 : 0
+ai_confidence_long += (sig_a_long and sig_u_long) ? 25 : (sig_a_long or sig_u_long) ? 10 : 0
+ai_confidence_long += htf_bull             ? 20 : 0
+ai_confidence_long := math.min(ai_confidence_long, 100)
+
+// Short confidence
+ai_confidence_short += chop_trend          ? 20 : 0
+ai_confidence_short += atr_ok              ? 20 : 0
+ai_confidence_short += frama_bearish       ? 15 : 0
+ai_confidence_short += (sig_a_short and sig_u_short) ? 25 : (sig_a_short or sig_u_short) ? 10 : 0
+ai_confidence_short += htf_bear            ? 20 : 0
+ai_confidence_short := math.min(ai_confidence_short, 100)
+
+// Display the relevant confidence in the table
+float ai_confidence = any_long_signal ? ai_confidence_long : any_short_signal ? ai_confidence_short :
+                      (a_in_long or u_in_long) ? ai_confidence_long : (a_in_short or u_in_short) ? ai_confidence_short :
+                      (ai_confidence_long + ai_confidence_short) / 2
+
+bool a_in_pos   = a_in_long or a_in_short
+bool u_in_pos   = u_in_long or u_in_short
+bool any_in_pos = a_in_pos or u_in_pos
+
+bool and_reversal_vs_long  = any_in_pos and (a_in_long  or u_in_long)  and ta.crossunder(and_osc, and_sig) and barstate.isconfirmed
+bool and_reversal_vs_short = any_in_pos and (a_in_short or u_in_short) and ta.crossover(and_osc,  and_sig) and barstate.isconfirmed
+
+bool reversal_warn = and_reversal_vs_long or and_reversal_vs_short
+
+float current_pnl_atr = 0.0
+if a_in_long  and not na(a_long_entry)  and not na(a_fix_atr) and a_fix_atr > 0
+    current_pnl_atr := (close - a_long_entry)  / a_fix_atr
+else if a_in_short and not na(a_short_entry) and not na(a_fix_atr) and a_fix_atr > 0
+    current_pnl_atr := (a_short_entry - close) / a_fix_atr
+else if u_in_long  and not na(u_long_entry)  and not na(u_fix_atr) and u_fix_atr > 0
+    current_pnl_atr := (close - u_long_entry)  / u_fix_atr
+else if u_in_short and not na(u_short_entry) and not na(u_fix_atr) and u_fix_atr > 0
+    current_pnl_atr := (u_short_entry - close) / u_fix_atr
+
+// Partial TP hint (one-shot trigger)
+var bool partial_tp_triggered = false
+
+// Reset on new entry signal
+if sig_a_long or sig_u_long or sig_a_short or sig_u_short
+    partial_tp_triggered := false
+
+// Calculate progress
+float progress = na
+if any_in_pos
+    float tp_target = a_in_long  ? a_long_tp  : a_in_short ? a_short_tp :
+                      u_in_long  ? u_long_tp  : u_in_short ? u_short_tp : na
+    float entry_ref = a_in_long  ? a_long_entry  : a_in_short ? a_short_entry :
+                      u_in_long  ? u_long_entry  : u_in_short ? u_short_entry : na
+    if not na(tp_target) and not na(entry_ref) and math.abs(tp_target - entry_ref) > 0
+        if a_in_long or u_in_long
+            progress := (close - entry_ref) / (tp_target - entry_ref)
+        else
+            progress := (entry_ref - close) / (entry_ref - tp_target)
+        progress := math.max(0.0, progress)
+
+// Trigger once when 50% reached
+if enable_partial_tp and any_in_pos and not partial_tp_triggered and not na(progress) and progress >= 0.5
+    partial_tp_triggered := true
+
+bool partial_tp_hint = partial_tp_triggered
+
+string rev_text  = ""
+color  rev_color = color.gray
+if reversal_warn and any_in_pos
+    if current_pnl_atr >= 0.3
+        rev_text  := "Consider Exit"
+        rev_color := color.orange
+    else if current_pnl_atr > -0.2
+        rev_text  := "Move to BE"
+        rev_color := color.yellow
+    else
+        rev_text  := "High Risk"
+        rev_color := color.red
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 13. DUAL TRACK MANAGEMENT: A TRACK
+// ═════════════════════════════════════════════════════════════════════════════
+if sig_a_long
+    a_in_long           := true
+    a_long_entry        := close
+    a_fix_atr           := safe_atr
+    float a_tp_mult      = use_auto_params ? math.max(0.5, math.min(3.0, a_l_tp * vol_adj)) : tp_mult
+    a_long_tp           := close + a_fix_atr * a_tp_mult
+    a_long_sl           := close - a_fix_atr * (use_auto_params ? frama_sl_long : sl_mult)
+    a_long_trail        := a_long_sl
+    a_entry_price       := close
+    a_entry_atr         := safe_atr
+    a_trade_dir         := 1
+    a_long_bar          := bar_index
+    last_a_long_bar     := bar_index
+else if a_in_long
+    if (bar_index - a_long_bar) >= max_bars_hold
+        a_exit_price := close
+        a_in_long    := false
+        a_total      += 1
+        if close > a_long_entry
+            a_wins   += 1
+    else if high >= a_long_tp
+        a_exit_price := a_long_tp
+        a_in_long    := false
+        a_total      += 1
+        a_wins       += 1
+    else
+        if use_trailing
+            a_long_trail := math.max(a_long_trail, close - a_fix_atr * trail_mult)
+        float a_sl_val = use_trailing ? a_long_trail : a_long_sl
+        if low <= a_sl_val
+            a_exit_price := math.min(close, a_sl_val)
+            a_in_long    := false
+            a_total      += 1
+            if a_exit_price > a_long_entry
+                a_wins   += 1
+
+if sig_a_short
+    a_in_short          := true
+    a_short_entry       := close
+    a_fix_atr           := safe_atr
+    float a_tp_mult      = use_auto_params ? math.max(0.5, math.min(3.0, a_s_tp * vol_adj)) : tp_mult
+    a_short_tp          := close - a_fix_atr * a_tp_mult
+    a_short_sl          := close + a_fix_atr * (use_auto_params ? frama_sl_short : sl_mult)
+    a_short_trail       := a_short_sl
+    a_entry_price       := close
+    a_entry_atr         := safe_atr
+    a_trade_dir         := -1
+    a_short_bar         := bar_index
+    last_a_short_bar    := bar_index
+else if a_in_short
+    if (bar_index - a_short_bar) >= max_bars_hold
+        a_exit_price  := close
+        a_in_short    := false
+        a_total       += 1
+        if close < a_short_entry
+            a_wins    += 1
+    else if low <= a_short_tp
+        a_exit_price  := a_short_tp
+        a_in_short    := false
+        a_total       += 1
+        a_wins        += 1
+    else
+        if use_trailing
+            a_short_trail := math.min(a_short_trail, close + a_fix_atr * trail_mult)
+        float a_sl_val = use_trailing ? a_short_trail : a_short_sl
+        if high >= a_sl_val
+            a_exit_price := math.max(close, a_sl_val)
+            a_in_short   := false
+            a_total      += 1
+            if a_exit_price < a_short_entry
+                a_wins   += 1
+
+// --- U TRACK ---
+if sig_u_long
+    u_in_long           := true
+    u_long_entry        := close
+    u_fix_atr           := safe_atr
+    float u_tp_mult      = use_auto_params ? math.max(0.5, math.min(3.0, u_l_tp * vol_adj)) : tp_mult
+    u_long_tp           := close + u_fix_atr * u_tp_mult
+    u_long_sl           := close - u_fix_atr * (use_auto_params ? frama_sl_long : sl_mult)
+    u_long_trail        := u_long_sl
+    u_entry_price       := close
+    u_entry_atr         := safe_atr
+    u_trade_dir         := 1
+    u_long_bar          := bar_index
+    last_u_long_bar     := bar_index
+else if u_in_long
+    if (bar_index - u_long_bar) >= max_bars_hold
+        u_exit_price  := close
+        u_in_long     := false
+        u_total       += 1
+        if close > u_long_entry
+            u_wins    += 1
+    else if high >= u_long_tp
+        u_exit_price  := u_long_tp
+        u_in_long     := false
+        u_total       += 1
+        u_wins        += 1
+    else
+        if use_trailing
+            u_long_trail := math.max(u_long_trail, close - u_fix_atr * trail_mult)
+        float u_sl_val = use_trailing ? u_long_trail : u_long_sl
+        if low <= u_sl_val
+            u_exit_price := math.min(close, u_sl_val)
+            u_in_long    := false
+            u_total      += 1
+            if u_exit_price > u_long_entry
+                u_wins   += 1
+
+if sig_u_short
+    u_in_short          := true
+    u_short_entry       := close
+    u_fix_atr           := safe_atr
+    float u_tp_mult      = use_auto_params ? math.max(0.5, math.min(3.0, u_s_tp * vol_adj)) : tp_mult
+    u_short_tp          := close - u_fix_atr * u_tp_mult
+    u_short_sl          := close + u_fix_atr * (use_auto_params ? frama_sl_short : sl_mult)
+    u_short_trail       := u_short_sl
+    u_entry_price       := close
+    u_entry_atr         := safe_atr
+    u_trade_dir         := -1
+    u_short_bar         := bar_index
+    last_u_short_bar    := bar_index
+else if u_in_short
+    if (bar_index - u_short_bar) >= max_bars_hold
+        u_exit_price  := close
+        u_in_short    := false
+        u_total       += 1
+        if close < u_short_entry
+            u_wins    += 1
+    else if low <= u_short_tp
+        u_exit_price  := u_short_tp
+        u_in_short    := false
+        u_total       += 1
+        u_wins        += 1
+    else
+        if use_trailing
+            u_short_trail := math.min(u_short_trail, close + u_fix_atr * trail_mult)
+        float u_sl_val = use_trailing ? u_short_trail : u_short_sl
+        if high >= u_sl_val
+            u_exit_price := math.max(close, u_sl_val)
+            u_in_short   := false
+            u_total      += 1
+            if u_exit_price < u_short_entry
+                u_wins   += 1
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FIX: Сброс partial_tp_triggered при закрытии любой позиции
+// ═════════════════════════════════════════════════════════════════════════════
+var bool was_in_pos = false
+bool now_in_pos = a_in_long or a_in_short or u_in_long or u_in_short
+
+if was_in_pos and not now_in_pos
+    partial_tp_triggered := false
+
+was_in_pos := now_in_pos
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 14. VISUALS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// A signals
+plotshape(sig_a_long,  title = "A BUY",  text = "A Buy",  style = shape.labelup,
+          location = location.belowbar, color = a_buy_col,  textcolor = color.white, size = size.small)
+plotshape(sig_a_short, title = "A SELL", text = "A Sell", style = shape.labeldown,
+          location = location.abovebar, color = a_sell_col, textcolor = color.white, size = size.small)
+
+// U signals
+plotshape(sig_u_long,  title = "U BUY",  text = "U Buy",  style = shape.labelup,
+          location = location.belowbar, color = u_buy_col,  textcolor = color.white, size = size.small)
+plotshape(sig_u_short, title = "U SELL", text = "U Sell", style = shape.labeldown,
+          location = location.abovebar, color = u_sell_col, textcolor = color.white, size = size.small)
+
+// U TP
+plot(show_sl_tp ? (u_in_long  ? u_long_tp  : na) : na, "U Long TP",
+     color = u_tp_col, style = plot.style_cross, linewidth = 2)
+plot(show_sl_tp ? (u_in_short ? u_short_tp : na) : na, "U Short TP",
+     color = u_tp_col, style = plot.style_cross, linewidth = 2)
+
+// A TP
+plot(show_sl_tp ? (a_in_long  ? a_long_tp  : na) : na, "A Long TP",
+     color = a_tp_col, style = plot.style_cross, linewidth = 2)
+plot(show_sl_tp ? (a_in_short ? a_short_tp : na) : na, "A Short TP",
+     color = a_tp_col, style = plot.style_cross, linewidth = 2)
+
+// SL 
+plot(show_sl_tp and a_in_long  ? a_long_sl  : na, "A Long SL",  color = sl_col, style = plot.style_cross, linewidth = 1)
+plot(show_sl_tp and a_in_short ? a_short_sl : na, "A Short SL", color = sl_col, style = plot.style_cross, linewidth = 1)
+plot(show_sl_tp and u_in_long  ? u_long_sl  : na, "U Long SL",  color = sl_col, style = plot.style_cross, linewidth = 1)
+plot(show_sl_tp and u_in_short ? u_short_sl : na, "U Short SL", color = sl_col, style = plot.style_cross, linewidth = 1)
+
+// Trailing stops
+plot(a_in_long  and use_trailing ? a_long_trail  : na, "A L-Trail",
+     color = color.new(a_tp_col, 30), style = plot.style_circles, linewidth = 1)
+plot(a_in_short and use_trailing ? a_short_trail : na, "A S-Trail",
+     color = color.new(a_tp_col, 30), style = plot.style_circles, linewidth = 1)
+plot(u_in_long  and use_trailing ? u_long_trail  : na, "U L-Trail",
+     color = color.new(u_tp_col, 30), style = plot.style_circles, linewidth = 1)
+plot(u_in_short and use_trailing ? u_short_trail : na, "U S-Trail",
+     color = color.new(u_tp_col, 30), style = plot.style_circles, linewidth = 1)
+
+// Bar color
+barbuy  = use_frama_filter ? frama_bullish : (ut_src > xATRTrailingStop)
+barsell = use_frama_filter ? frama_bearish : (ut_src < xATRTrailingStop)
+barcolor(barbuy  ? color.new(color.green, 50) : barsell ? color.new(color.red, 50) : na)
+
+// Bollinger Bands
+basis = ma(bb_src, bb_len, bb_maType)
+dev   = bb_mult * ta.stdev(bb_src, bb_len)
+upper = basis + dev
+lower = basis - dev
+plot(show_bb ? basis : na, "BB Basis", color = bb_basis_col, offset = bb_offset)
+bb_p1 = plot(show_bb ? upper : na, "BB Upper", color = bb_upper_col, offset = bb_offset)
+bb_p2 = plot(show_bb ? lower : na, "BB Lower", color = bb_lower_col, offset = bb_offset)
+fill(bb_p1, bb_p2, title = "BB Background", color = bb_fill_col)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 15. TABLE
+// ═════════════════════════════════════════════════════════════════════════════
+
+var table tbl = na
+
+if show_table and barstate.islast
+    if na(tbl)
+        tbl := table.new(tbl_pos, 4, 12,
+              bgcolor = color.new(color.black, 70),
+              border_width = 1, border_color = color.gray,
+              frame_color = color.gray, frame_width = 1)
+
+    a_wr = a_total > 0 ? (a_wins / a_total) * 100 : 0.0
+    u_wr = u_total > 0 ? (u_wins / u_total) * 100 : 0.0
+
+    string a_pos = a_in_long ? "LONG" : a_in_short ? "SHORT" : "—"
+    string u_pos = u_in_long ? "LONG" : u_in_short ? "SHORT" : "—"
+    color  a_col = a_in_long ? color.lime : a_in_short ? color.red : color.gray
+    color  u_col = u_in_long ? color.lime : u_in_short ? color.red : color.gray
+
+    string filter_mode = use_frama_filter and use_chop ? "FRAMA + CHOP" :
+                         use_frama_filter ? "FRAMA" : use_chop ? "CHOP" : "None"
+
+    // MARKET
+    table.cell(tbl, 0, 0,  "MARKET",     text_color = #1b02fa, text_size = size.small)
+    table.cell(tbl, 1, 0,  "",           text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 1,  "FRAMA Tr:",  text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 1,  frama_bullish ? "BULL" : frama_bearish ? "BEAR" : "RANGE",
+               text_color = frama_bullish ? color.lime : frama_bearish ? color.red : color.yellow, text_size = size.small)
+    table.cell(tbl, 0, 2,  "ATR:",       text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 2,  str.tostring(atr14, "#.##"), text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 0, 3,  "CHOP:",      text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 3,  str.tostring(ci, "#.#") + (chop_trend ? " TREND" : " SIDE"),
+               text_color = chop_trend ? color.lime : color.orange, text_size = size.small)
+    
+    table.cell(tbl, 0, 4,  "FRAMA SL:",  text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 4,  str.tostring(sugg_sl, "#.##") + "x ATR", text_color = color.orange, text_size = size.small)
+    
+    table.cell(tbl, 0, 6, "ADVISOR",    text_color = #1b02fa,     text_size = size.small)
+    table.cell(tbl, 1, 6, "",           text_color = color.white, text_size = size.small)
+    // A TRACK
+    table.cell(tbl, 0, 7,  "A TRACK",    text_color = color.teal,  text_size = size.small)
+    table.cell(tbl, 1, 7,  a_pos,        text_color = a_col,       text_size = size.small)
+    table.cell(tbl, 0, 8,  "A Win Rate:", text_color = color.teal, text_size = size.small)
+    table.cell(tbl, 1, 8,  str.tostring(a_wr, "#.#") + "%",
+               text_color = a_wr >= 50 ? color.lime : color.orange, text_size = size.small)
+    table.cell(tbl, 0, 9, "A Trades:",  text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 9, str.tostring(a_wins) + " / " + str.tostring(a_total),
+               text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 10, "A L/S-TP:",  text_color = color.teal,  text_size = size.small)
+    table.cell(tbl, 1, 10, str.tostring(a_l_tp, "#.##") + " / " + str.tostring(a_s_tp, "#.##") + "x",
+               text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 0, 11, "A Sugg.TP:", text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 11, str.tostring(a_sugg_tp, "#.##") + "x ATR", text_color = color.teal, text_size = size.small)
+    
+    string pos_status = "—"
+    color  pos_color  = color.gray
+    if any_in_pos
+        if reversal_warn and rev_text != ""
+            pos_status := rev_text
+            pos_color  := rev_color
+        else if partial_tp_hint
+            pos_status := "Partial TP >"
+            pos_color  := color.yellow
+        else
+            string pnl_sign = current_pnl_atr >= 0 ? "+" : ""
+            pos_status := "PnL: " + pnl_sign + str.tostring(current_pnl_atr, "#.##") + " ATR"
+            pos_color  := current_pnl_atr >= 0 ? color.lime : color.red
+
+    table.cell(tbl, 2, 6, "Position:",  text_color = color.white, text_size = size.small)
+    table.cell(tbl, 3, 6, pos_status,   text_color = pos_color,   text_size = size.small,
+               bgcolor = reversal_warn and any_in_pos ? color.new(color.orange, 80) :
+                         partial_tp_hint              ? color.new(color.yellow, 85) :
+                                                        color.new(color.black, 100))
+
+    // U TRACK
+    table.cell(tbl, 2, 7, "U TRACK",    text_color = color.green, text_size = size.small)
+    table.cell(tbl, 3, 7, u_pos,        text_color = u_col,       text_size = size.small)
+    table.cell(tbl, 2, 8, "U Win Rate:", text_color = color.green, text_size = size.small)
+    table.cell(tbl, 3, 8, str.tostring(u_wr, "#.#") + "%",
+               text_color = u_wr >= 50 ? color.lime : color.orange, text_size = size.small)
+    table.cell(tbl, 2, 9, "U Trades:",  text_color = color.white, text_size = size.small)
+    table.cell(tbl, 3, 9, str.tostring(u_wins) + " / " + str.tostring(u_total),
+               text_color = color.white, text_size = size.small)
+    table.cell(tbl, 2, 10, "U L/S-TP:",  text_color = color.green, text_size = size.small)
+    table.cell(tbl, 3, 10, str.tostring(u_l_tp, "#.##") + " / " + str.tostring(u_s_tp, "#.##") + "x",
+               text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 2, 11, "U Sugg.TP:", text_color = color.white, text_size = size.small)
+    table.cell(tbl, 3, 11, str.tostring(u_sugg_tp, "#.##") + "x ATR", text_color = color.lime, text_size = size.small)
+    
+    // ADVISOR
+    
+    table.cell(tbl, 2, 1, "A " + (enable_a ? "ON ✅" : "OFF ❌") + "  U " + (enable_u ? "ON ✅" : "OFF ❌"),
+               text_color = color.gray, text_size = size.small)
+    table.cell(tbl, 3, 1, "AI Conf: " + str.tostring(ai_confidence, "#") + "%",
+               text_color = ai_confidence >= 80 ? color.lime : ai_confidence >= 60 ? color.orange : color.red,
+               text_size = size.small)
+    table.cell(tbl, 2, 2,  "Filter:",    text_color = color.white, text_size = size.small)
+    table.cell(tbl, 3, 2,  filter_mode,  text_color = color.yellow, text_size = size.small)
+    table.cell(tbl, 2, 3, "Rec. Lev.:", text_color = color.white, text_size = size.small)
+    table.cell(tbl, 3, 3, "x" + str.tostring(sugg_lev, "#"), text_color = color.yellow, text_size = size.small)
+    table.cell(tbl, 2, 4,  "Regime:",    text_color = color.white, text_size = size.small)
+    table.cell(tbl, 3, 4,  atr_regime,
+               text_color = atr_regime == "CHAOS" ? color.red : atr_regime == "TREND" ? color.lime : color.gray,
+               text_size = size.small)
+    table.cell(tbl, 2, 5, "", text_color = color.new(color.gray, 50), text_size = size.tiny)
+    table.cell(tbl, 3, 5, "",           text_color = color.gray, text_size = size.tiny)
+
+else if not show_table and not na(tbl)
+    table.delete(tbl)
+    tbl := na
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 16. ALERTS
+// ═════════════════════════════════════════════════════════════════════════════
+alertcondition(sig_u_long,              "U BUY",          "U BUY @ {{close}} | UT Bot — enter next bar open")
+alertcondition(sig_u_short,             "U SELL",         "U SELL @ {{close}} | UT Bot — enter next bar open")
+alertcondition(sig_a_long,              "A BUY",          "A BUY @ {{close}} | Andean+MFI — enter next bar open")
+alertcondition(sig_a_short,             "A SELL",         "A SELL @ {{close}} | Andean+MFI — enter next bar open")
+alertcondition(sig_a_long and sig_u_long,  "A+U BUY",     "A+U BUY @ {{close}} | Both tracks aligned LONG")
+alertcondition(sig_a_short and sig_u_short,"A+U SELL",    "A+U SELL @ {{close}} | Both tracks aligned SHORT")
+alertcondition(and_reversal_vs_long,    "Long Reversal",  "Reversal vs LONG @ {{close}} — consider exit")
+alertcondition(and_reversal_vs_short,   "Short Reversal", "Reversal vs SHORT @ {{close}} — consider exit")
