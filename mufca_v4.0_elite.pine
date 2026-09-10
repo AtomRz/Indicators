@@ -34,13 +34,33 @@ atr_max          = input.float(4.5,  "Max ATR %",
 use_hurst        = input.bool(false, "Use Hurst Filter",
                    tooltip = "Blocks signals when the market is close to a random walk (Hurst ≈ 0.5), based on a rolling R/S exponent of log-returns. Direction-agnostic — doesn't bias long vs short, just filters out low-clarity regimes. Recomputed once per closed bar for performance.",
                    group = filter_grp)
-hurst_window     = input.int(100,    "Hurst Window",
-                   minval = 32,
-                   tooltip = "Bars used for the rolling R/S Hurst estimate. Larger = smoother/slower, smaller = more reactive but noisier.",
+hurst_window_1h  = input.int(29,     "Hurst Window (1h chart)",
+                   minval = 16,
+                   tooltip = "Bars used for the rolling R/S Hurst estimate when the chart's timeframe is 1h. Only applies while viewing a 1h chart — see Other TF below for anything else.",
                    group = filter_grp)
+hurst_window_4h  = input.int(23,     "Hurst Window (4h chart)",
+                   minval = 16,
+                   tooltip = "Bars used for the rolling R/S Hurst estimate when the chart's timeframe is 4h. Only applies while viewing a 4h chart — see Other TF below for anything else.",
+                   group = filter_grp)
+hurst_window_other = input.int(23,   "Hurst Window (Other TF)",
+                   minval = 16,
+                   tooltip = "Used for any chart timeframe other than 1h/4h (15m, 1D, etc). The optimal window is pair/TF-specific, not universal — re-tune per timeframe using the debug label/table rather than assuming this carries over.",
+                   group = filter_grp)
+hurst_window = timeframe.period == "60" ? hurst_window_1h : timeframe.period == "240" ? hurst_window_4h : hurst_window_other
+// Larger window = smoother/slower but more lagging (tends to confirm trend
+// late, after the best entries already passed). Smaller = more reactive,
+// catches trend confirmation earlier, but too small degrades toward a
+// meaningless neutral 0.5 (the R/S chunk-size set collapses below
+// window≈16-20). 23 (4h) / 29 (1h) tested as local sweet spots on
+// ETHUSDT.P — re-validate per pair before trusting as universal; this is
+// exactly why the setting is split per-TF instead of one global default.
 hurst_min_dev    = input.float(0.12, "Hurst Min Deviation from 0.5",
                    minval = 0.0, maxval = 0.5, step = 0.01,
-                   tooltip = "Reject if abs(hurst - 0.5) is below this. Higher = stricter (blocks more borderline/random-walk regimes).",
+                   tooltip = "Trending Only mode: reject unless (hurst - 0.5) >= this. Symmetric mode: reject if abs(hurst - 0.5) is below this. Higher = stricter.",
+                   group = filter_grp)
+hurst_mode       = input.string("Trending Only", "Hurst Mode",
+                   options = ["Trending Only", "Symmetric (Trend + Mean-Rev)"],
+                   tooltip = "Trending Only (recommended): only allows entries when Hurst > 0.5 + deviation — matches this script's trend-following/breakout signal logic (Andean+MFI, UT Bot), which tends to lose more in mean-reverting regimes. Symmetric: also allows Hurst < 0.5 - deviation (mean-reverting), which is only appropriate if you pair this filter with mean-reversion-style entries — not what A/U tracks do here.",
                    group = filter_grp)
 show_hurst_label = input.bool(false, "Show Hurst Debug Label",
                    tooltip = "Shows the current Hurst exponent value in the corner of the chart for tuning.",
@@ -594,13 +614,14 @@ chop_ok        = use_chop ? chop_trend : true
 var float hurst_val = na
 if use_hurst and barstate.isconfirmed
     hurst_val := f_hurst(hurst_window)
-hurst_ok = use_hurst ? (not na(hurst_val) and math.abs(hurst_val - 0.5) >= hurst_min_dev) : true
+hurst_pass_trend    = not na(hurst_val) and (hurst_val - 0.5) >= hurst_min_dev
+hurst_pass_symmetric = not na(hurst_val) and math.abs(hurst_val - 0.5) >= hurst_min_dev
+hurst_ok = use_hurst ? (hurst_mode == "Trending Only" ? hurst_pass_trend : hurst_pass_symmetric) : true
 
 var label hurst_dbg_lbl = na
 if show_hurst_label and barstate.islast
     label.delete(hurst_dbg_lbl[1])
-    string hurst_txt = na(hurst_val) ? "Hurst: n/a" : "Hurst: " + str.tostring(hurst_val, "#.###") +
-                        (hurst_val > 0.5 + hurst_min_dev ? " (trending)" : hurst_val < 0.5 - hurst_min_dev ? " (mean-rev)" : " (random-walk, blocked)")
+    string hurst_txt = na(hurst_val) ? "Hurst: n/a" : "Hurst: " + str.tostring(hurst_val, "#.###") + (hurst_val > 0.5 + hurst_min_dev ? " (trending)" : hurst_val < 0.5 - hurst_min_dev ? " (mean-rev)" : " (random-walk, blocked)") + (hurst_mode == "Trending Only" and hurst_val <= 0.5 + hurst_min_dev ? " [blocked: trend-only mode]" : "")
     hurst_dbg_lbl := label.new(bar_index, high + safe_atr14 * 2, hurst_txt,
          style = label.style_label_down, color = color.new(color.blue, 20), textcolor = color.white, size = size.small)
 
@@ -817,6 +838,31 @@ bool sig_u_short = enable_u and active_u_short and not u_in_short and not u_in_l
 
 bool any_long_signal  = sig_a_long  or sig_u_long
 bool any_short_signal = sig_a_short or sig_u_short
+
+// ── HURST DIAGNOSTIC ──────────────────────────────────────────────────────
+// Counts how many times Hurst was the ONLY thing blocking an otherwise-valid
+// signal (all other filters — FRAMA, CHOP, ATR, HTF, fake-break, liq-sweep —
+// already passed). If this stays at 0 while the filter is ON, Hurst isn't
+// actually binding here: it's redundant with CHOP/FRAMA-slope, which already
+// select for a similar "clearly trending, not sideways" regime on this
+// instrument/timeframe. If it's a large number but A/U Trades didn't change,
+// something is wired wrong — worth reporting.
+filter_long_no_hurst  = frama_ok_long  and chop_ok and atr_ok and frama_slope_ok_long  and
+     (not enable_mtf_bias or htf_bull) and (not enable_fake_break or not fake_break_long)  and (not enable_liq_sweep or not liq_sweep_short)
+filter_short_no_hurst = frama_ok_short and chop_ok and atr_ok and frama_slope_ok_short and
+     (not enable_mtf_bias or htf_bear) and (not enable_fake_break or not fake_break_short) and (not enable_liq_sweep or not liq_sweep_long)
+
+bool would_a_long  = enable_a and confirm_long_a  and warmed_up and filter_long_no_hurst  and not a_in_long  and not a_in_short and a_long_cooldown_ok  and barstate.isconfirmed
+bool would_a_short = enable_a and confirm_short_a and warmed_up and filter_short_no_hurst and not a_in_short and not a_in_long  and a_short_cooldown_ok and barstate.isconfirmed
+bool would_u_long  = enable_u and ut_buy_raw  and filter_long_no_hurst  and not u_in_long  and not u_in_short and u_long_cooldown_ok  and barstate.isconfirmed
+bool would_u_short = enable_u and ut_sell_raw and filter_short_no_hurst and not u_in_short and not u_in_long  and u_short_cooldown_ok and barstate.isconfirmed
+
+var int hurst_blocked_count = 0
+var int would_fire_count    = 0
+if barstate.isconfirmed and (would_a_long or would_a_short or would_u_long or would_u_short)
+    would_fire_count += 1
+    if use_hurst and not hurst_ok
+        hurst_blocked_count += 1
 
 float ai_confidence_long  = 0.0
 float ai_confidence_short = 0.0
@@ -1159,7 +1205,7 @@ if show_table and barstate.islast
     table.cell(tbl, 1, 4,  str.tostring(sugg_sl, "#.##") + "x ATR", text_color = color.orange, text_size = size.small)
 
     table.cell(tbl, 0, 5,  "Hurst:",     text_color = color.white, text_size = size.small)
-    table.cell(tbl, 1, 5,  not use_hurst ? "OFF" : na(hurst_val) ? "warming up" : str.tostring(hurst_val, "#.###"),
+    table.cell(tbl, 1, 5,  not use_hurst ? "OFF" : na(hurst_val) ? "warming up" : str.tostring(hurst_val, "#.###") + (hurst_mode == "Trending Only" ? " (T)" : " (T+MR)"),
                text_color = not use_hurst ? color.gray :
                             na(hurst_val) ? color.gray :
                             hurst_ok ? (hurst_val > 0.5 ? color.lime : color.orange) : color.red,
@@ -1232,8 +1278,9 @@ if show_table and barstate.islast
     table.cell(tbl, 3, 4,  atr_regime,
                text_color = atr_regime == "CHAOS" ? color.red : atr_regime == "TREND" ? color.lime : color.gray,
                text_size = size.small)
-    table.cell(tbl, 2, 5, "", text_color = color.new(color.gray, 50), text_size = size.tiny)
-    table.cell(tbl, 3, 5, "",           text_color = color.gray, text_size = size.tiny)
+    table.cell(tbl, 2, 5, "Hurst blk:", text_color = color.new(color.gray, 0), text_size = size.tiny)
+    table.cell(tbl, 3, 5, str.tostring(hurst_blocked_count) + " / " + str.tostring(would_fire_count),
+               text_color = hurst_blocked_count > 0 ? color.orange : color.gray, text_size = size.tiny)
 
 else if not show_table and not na(tbl)
     table.delete(tbl)
