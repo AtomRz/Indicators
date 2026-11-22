@@ -16,6 +16,7 @@ indicator("MUFCA [AtomDC] v6 - Elite", overlay = true, max_labels_count = 500, m
 //   + Volume-flow leverage adjustment (OBV / OBV momentum / volume pressure / relative volume)
 //   + Low-volume entry gate (metrics bar / smooth / thin / how) — off by default, like the bot
 //   + Market shock guard (4 bars, 5 x ATR) — warns, optional entry block
+//   + Volume Profile histogram (POC / VAH / VAL, same 300 bars / 50 bins / 70% VA as the TP cap)
 //   + Entry switches per track/side: allow / block_trend / block_all
 //   + Defaults refreshed from config.py: FRAMA 22 / 2.1, Hurst windows 221 (1h) / 140 (4h), Hurst min dev 0.12
 //   Carried over from v5: adaptive SL (MAE) + adaptive TP1/TP2 (weighted MFE percentile), regime
@@ -315,6 +316,24 @@ ob_vp_va = input.float(0.70, "VP Value Area",
      minval = 0.1, maxval = 0.95, step = 0.05,
      tooltip = "Share of volume in the Value Area (bot: 0.70).",
      group = cap_grp)
+
+vph_grp = "VOLUME PROFILE HISTOGRAM"
+vp_show = input.bool(true, "Show Volume Profile",
+     tooltip = "Draws the profile used by the TP obstacle cap (same lookback / bins / value area as the TP Obstacle Cap group): histogram, POC, VAH and VAL. Built from closed bars only, drawn on the last bar.",
+     group = vph_grp)
+vp_hist = input.bool(true, "Show Histogram Bars",
+     tooltip = "Off = keep only the POC line and the Value Area band (bot: show_histogram).",
+     group = vph_grp)
+vp_side = input.string("right", "Histogram Side", options = ["right", "left"],
+     tooltip = "Edge of the profile window the bars grow from (bot: histogram_side).",
+     group = vph_grp)
+vp_width = input.int(40, "Histogram Width (bars)", minval = 5, maxval = 200,
+     tooltip = "Width of the longest bar, in chart bars.",
+     group = vph_grp)
+vp_col_va = input.color(color.new(color.blue, 70), "Value Area Bars", group = vph_grp, inline = "vpc")
+vp_col_out = input.color(color.new(color.gray, 80), "Outside Bars", group = vph_grp, inline = "vpc")
+vp_col_poc = input.color(color.orange, "POC", group = vph_grp, inline = "vpl")
+vp_col_va_line = input.color(color.new(color.aqua, 20), "VAH / VAL", group = vph_grp, inline = "vpl")
 
 gate_grp = "VOLUME & SAFETY GATES"
 use_vol_lev = input.bool(true, "Volume-Flow Leverage Adjustment",
@@ -1789,6 +1808,86 @@ plot(show_bb ? basis : na, "BB Basis", color = bb_basis_col, offset = bb_offset)
 bb_p1 = plot(show_bb ? upper : na, "BB Upper", color = bb_upper_col, offset = bb_offset)
 bb_p2 = plot(show_bb ? lower : na, "BB Lower", color = bb_lower_col, offset = bb_offset)
 fill(bb_p1, bb_p2, title = "BB Background", color = bb_fill_col)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 12b. VOLUME PROFILE HISTOGRAM (same maths as f_vp / market_structure.calc_volume_profile)
+// ═════════════════════════════════════════════════════════════════════════════
+var array<box>  vp_boxes = array.new<box>()
+var array<line> vp_lines = array.new<line>()
+var array<label> vp_lbls = array.new<label>()
+
+if vp_show and barstate.islast
+    for bx in vp_boxes
+        box.delete(bx)
+    for ln in vp_lines
+        line.delete(ln)
+    for lb in vp_lbls
+        label.delete(lb)
+    array.clear(vp_boxes)
+    array.clear(vp_lines)
+    array.clear(vp_lbls)
+
+    int k0 = barstate.isconfirmed ? 0 : 1          // closed bars only, like the bot
+    int win = math.min(ob_vp_lookback, bar_index + 1 - k0)
+    if win >= 10
+        float pmin = low[k0]
+        float pmax = high[k0]
+        for k = k0 + 1 to k0 + win - 1
+            pmin := math.min(pmin, low[k])
+            pmax := math.max(pmax, high[k])
+        if pmax > pmin
+            float bw = (pmax - pmin) / ob_vp_bins
+            array<float> vb = array.new<float>(ob_vp_bins, 0.0)
+            for k = k0 to k0 + win - 1
+                float vo = volume[k]
+                if vo > 0.0
+                    int fb = math.min(math.max(int((low[k] - pmin) / bw), 0), ob_vp_bins - 1)
+                    if high[k] <= low[k]
+                        array.set(vb, fb, array.get(vb, fb) + vo)
+                    else
+                        int lb2 = math.min(math.max(int((high[k] - pmin) / bw), 0), ob_vp_bins - 1)
+                        float share = vo / (lb2 - fb + 1)
+                        for b = fb to lb2
+                            array.set(vb, b, array.get(vb, b) + share)
+            float tot = array.sum(vb)
+            float vmax = array.max(vb)
+            if tot > 0.0 and vmax > 0.0
+                int pi_ = array.indexof(vb, vmax)
+                float tgt = tot * math.min(math.max(ob_vp_va, 0.1), 0.95)
+                float cov = array.get(vb, pi_)
+                int lo_i = pi_
+                int hi_i = pi_
+                while cov < tgt and (lo_i > 0 or hi_i < ob_vp_bins - 1)
+                    float below = lo_i > 0 ? array.get(vb, lo_i - 1) : -1.0
+                    float above = hi_i < ob_vp_bins - 1 ? array.get(vb, hi_i + 1) : -1.0
+                    if above >= below
+                        hi_i += 1
+                        cov += array.get(vb, hi_i)
+                    else
+                        lo_i -= 1
+                        cov += array.get(vb, lo_i)
+                float poc_p = pmin + (pi_ + 0.5) * bw
+                float vah_p = pmin + (hi_i + 1) * bw
+                float val_p = pmin + lo_i * bw
+                int x_left  = bar_index - k0 - win + 1
+                int x_right = bar_index + 1
+                if vp_hist
+                    for i = 0 to ob_vp_bins - 1
+                        int wd = math.max(1, int(math.round(array.get(vb, i) / vmax * vp_width)))
+                        int xa = vp_side == "right" ? x_right + vp_width - wd : x_left
+                        int xb = vp_side == "right" ? x_right + vp_width : x_left + wd
+                        bool in_va = i >= lo_i and i <= hi_i
+                        array.push(vp_boxes, box.new(xa, pmin + (i + 1) * bw, xb, pmin + i * bw,
+                             border_color = color(na), bgcolor = in_va ? vp_col_va : vp_col_out))
+                else
+                    array.push(vp_boxes, box.new(x_left, vah_p, x_right, val_p,
+                         border_color = color(na), bgcolor = vp_col_va))
+                array.push(vp_lines, line.new(x_left, poc_p, x_right + vp_width, poc_p, color = vp_col_poc, width = 2))
+                array.push(vp_lines, line.new(x_left, vah_p, x_right + vp_width, vah_p, color = vp_col_va_line, style = line.style_dashed))
+                array.push(vp_lines, line.new(x_left, val_p, x_right + vp_width, val_p, color = vp_col_va_line, style = line.style_dashed))
+                array.push(vp_lbls, label.new(x_right + vp_width, poc_p, "POC " + str.tostring(poc_p, format.mintick), style = label.style_label_left, color = color(na), textcolor = vp_col_poc, size = size.small))
+                array.push(vp_lbls, label.new(x_right + vp_width, vah_p, "VAH " + str.tostring(vah_p, format.mintick), style = label.style_label_left, color = color(na), textcolor = vp_col_va_line, size = size.small))
+                array.push(vp_lbls, label.new(x_right + vp_width, val_p, "VAL " + str.tostring(val_p, format.mintick), style = label.style_label_left, color = color(na), textcolor = vp_col_va_line, size = size.small))
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 13. TABLE (compact)
