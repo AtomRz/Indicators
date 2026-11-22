@@ -333,6 +333,9 @@ vp_width = input.int(40, "Histogram Width (bars)", minval = 5, maxval = 200,
 vp_width_pct = input.float(12.0, "Left Histogram Width (% of visible chart)", minval = 2.0, maxval = 60.0, step = 1.0,
      tooltip = "Width of the longest bar in the \"left\" mode, as a share of the visible chart width.",
      group = vph_grp)
+vp_thick = input.float(45.0, "Bar Thickness (% of bin height)", minval = 5.0, maxval = 100.0, step = 5.0,
+     tooltip = "100 = bars touch each other; lower = thinner bars with a gap between them.",
+     group = vph_grp)
 vp_col_va = input.color(color.new(color.blue, 40), "Value Area Bars", group = vph_grp, inline = "vpc")
 vp_col_out = input.color(color.new(color.gray, 55), "Outside Bars", group = vph_grp, inline = "vpc")
 vp_col_poc = input.color(color.orange, "POC", group = vph_grp, inline = "vpl")
@@ -1885,8 +1888,9 @@ if vp_show and barstate.islast
                     for i = 0 to ob_vp_bins - 1
                         float vi = array.get(vb, i)
                         bool in_va = i >= lo_i and i <= hi_i
-                        float y_top = pmin + (i + 1) * bw
-                        float y_bot = pmin + i * bw
+                        float gap = bw * (1.0 - vp_thick / 100.0) / 2.0
+                        float y_top = pmin + (i + 1) * bw - gap
+                        float y_bot = pmin + i * bw + gap
                         if t_mode
                             int wt = math.max(tf_ms, int(span_t * vp_width_pct / 100.0 * vi / vmax))
                             array.push(vp_boxes, box.new(lv_t, y_top, lv_t + wt, y_bot, xloc = xloc.bar_time,
