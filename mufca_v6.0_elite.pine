@@ -330,8 +330,8 @@ vp_side = input.string("right", "Histogram Side", options = ["right", "left"],
 vp_width = input.int(40, "Histogram Width (bars)", minval = 5, maxval = 200,
      tooltip = "Width of the longest bar, in chart bars.",
      group = vph_grp)
-vp_col_va = input.color(color.new(color.blue, 70), "Value Area Bars", group = vph_grp, inline = "vpc")
-vp_col_out = input.color(color.new(color.gray, 80), "Outside Bars", group = vph_grp, inline = "vpc")
+vp_col_va = input.color(color.new(color.blue, 40), "Value Area Bars", group = vph_grp, inline = "vpc")
+vp_col_out = input.color(color.new(color.gray, 55), "Outside Bars", group = vph_grp, inline = "vpc")
 vp_col_poc = input.color(color.orange, "POC", group = vph_grp, inline = "vpl")
 vp_col_va_line = input.color(color.new(color.aqua, 20), "VAH / VAL", group = vph_grp, inline = "vpl")
 
