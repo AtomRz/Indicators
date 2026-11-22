@@ -325,10 +325,13 @@ vp_hist = input.bool(true, "Show Histogram Bars",
      tooltip = "Off = keep only the POC line and the Value Area band (bot: show_histogram).",
      group = vph_grp)
 vp_side = input.string("right", "Histogram Side", options = ["right", "left", "last bar"],
-     tooltip = "right = in the free space to the right of the last bar. left = at the start of the profile window (300 bars back). last bar = bars grow to the left from the last bar, over the price action (bot: histogram_side left/right).",
+     tooltip = "right = in the free space to the right of the last bar. left = pinned to the left edge of the visible chart at any zoom. last bar = bars grow to the left from the last bar, over the price action (bot: histogram_side left/right).",
      group = vph_grp)
 vp_width = input.int(40, "Histogram Width (bars)", minval = 5, maxval = 200,
      tooltip = "Width of the longest bar, in chart bars.",
+     group = vph_grp)
+vp_width_pct = input.float(12.0, "Left Histogram Width (% of visible chart)", minval = 2.0, maxval = 60.0, step = 1.0,
+     tooltip = "Width of the longest bar in the \"left\" mode, as a share of the visible chart width.",
      group = vph_grp)
 vp_col_va = input.color(color.new(color.blue, 40), "Value Area Bars", group = vph_grp, inline = "vpc")
 vp_col_out = input.color(color.new(color.gray, 55), "Outside Bars", group = vph_grp, inline = "vpc")
@@ -1872,23 +1875,49 @@ if vp_show and barstate.islast
                 int x_left  = bar_index - k0 - win + 1
                 int x_right = bar_index + 1
                 int x_end   = vp_side == "right" ? x_right + vp_width : x_right + 3
+                // "left" is pinned to the left edge of the VISIBLE chart (time based), so it follows zoom / scroll
+                bool t_mode = vp_side == "left"
+                int  tf_ms  = timeframe.in_seconds() * 1000
+                int  lv_t   = chart.left_visible_bar_time
+                int  span_t = math.max(chart.right_visible_bar_time - lv_t, tf_ms)
+                int  t_end  = time + 3 * tf_ms
                 if vp_hist
                     for i = 0 to ob_vp_bins - 1
-                        int wd = math.max(1, int(math.round(array.get(vb, i) / vmax * vp_width)))
-                        int xa = vp_side == "right" ? x_right + vp_width - wd : vp_side == "last bar" ? x_right - wd : x_left
-                        int xb = vp_side == "right" ? x_right + vp_width : vp_side == "last bar" ? x_right : x_left + wd
+                        float vi = array.get(vb, i)
                         bool in_va = i >= lo_i and i <= hi_i
-                        array.push(vp_boxes, box.new(xa, pmin + (i + 1) * bw, xb, pmin + i * bw,
-                             border_color = color(na), bgcolor = in_va ? vp_col_va : vp_col_out))
+                        float y_top = pmin + (i + 1) * bw
+                        float y_bot = pmin + i * bw
+                        if t_mode
+                            int wt = math.max(tf_ms, int(span_t * vp_width_pct / 100.0 * vi / vmax))
+                            array.push(vp_boxes, box.new(lv_t, y_top, lv_t + wt, y_bot, xloc = xloc.bar_time,
+                                 border_color = color(na), bgcolor = in_va ? vp_col_va : vp_col_out))
+                        else
+                            int wd = math.max(1, int(math.round(vi / vmax * vp_width)))
+                            int xa = vp_side == "right" ? x_right + vp_width - wd : x_right - wd
+                            int xb = vp_side == "right" ? x_right + vp_width : x_right
+                            array.push(vp_boxes, box.new(xa, y_top, xb, y_bot,
+                                 border_color = color(na), bgcolor = in_va ? vp_col_va : vp_col_out))
                 else
-                    array.push(vp_boxes, box.new(x_left, vah_p, x_right, val_p,
-                         border_color = color(na), bgcolor = vp_col_va))
-                array.push(vp_lines, line.new(x_left, poc_p, x_end, poc_p, color = vp_col_poc, width = 2))
-                array.push(vp_lines, line.new(x_left, vah_p, x_end, vah_p, color = vp_col_va_line, style = line.style_dashed))
-                array.push(vp_lines, line.new(x_left, val_p, x_end, val_p, color = vp_col_va_line, style = line.style_dashed))
-                array.push(vp_lbls, label.new(x_end, poc_p, "POC " + str.tostring(poc_p, format.mintick), style = label.style_label_left, color = color(na), textcolor = vp_col_poc, size = size.small))
-                array.push(vp_lbls, label.new(x_end, vah_p, "VAH " + str.tostring(vah_p, format.mintick), style = label.style_label_left, color = color(na), textcolor = vp_col_va_line, size = size.small))
-                array.push(vp_lbls, label.new(x_end, val_p, "VAL " + str.tostring(val_p, format.mintick), style = label.style_label_left, color = color(na), textcolor = vp_col_va_line, size = size.small))
+                    if t_mode
+                        array.push(vp_boxes, box.new(lv_t, vah_p, t_end, val_p, xloc = xloc.bar_time,
+                             border_color = color(na), bgcolor = vp_col_va))
+                    else
+                        array.push(vp_boxes, box.new(x_left, vah_p, x_right, val_p,
+                             border_color = color(na), bgcolor = vp_col_va))
+                if t_mode
+                    array.push(vp_lines, line.new(lv_t, poc_p, t_end, poc_p, xloc = xloc.bar_time, color = vp_col_poc, width = 1))
+                    array.push(vp_lines, line.new(lv_t, vah_p, t_end, vah_p, xloc = xloc.bar_time, color = vp_col_va_line, style = line.style_dashed, width = 1))
+                    array.push(vp_lines, line.new(lv_t, val_p, t_end, val_p, xloc = xloc.bar_time, color = vp_col_va_line, style = line.style_dashed, width = 1))
+                    array.push(vp_lbls, label.new(t_end, poc_p, "POC " + str.tostring(poc_p, format.mintick), xloc = xloc.bar_time, style = label.style_label_left, color = color(na), textcolor = vp_col_poc, size = size.small))
+                    array.push(vp_lbls, label.new(t_end, vah_p, "VAH " + str.tostring(vah_p, format.mintick), xloc = xloc.bar_time, style = label.style_label_left, color = color(na), textcolor = vp_col_va_line, size = size.small))
+                    array.push(vp_lbls, label.new(t_end, val_p, "VAL " + str.tostring(val_p, format.mintick), xloc = xloc.bar_time, style = label.style_label_left, color = color(na), textcolor = vp_col_va_line, size = size.small))
+                else
+                    array.push(vp_lines, line.new(x_left, poc_p, x_end, poc_p, color = vp_col_poc, width = 1))
+                    array.push(vp_lines, line.new(x_left, vah_p, x_end, vah_p, color = vp_col_va_line, style = line.style_dashed, width = 1))
+                    array.push(vp_lines, line.new(x_left, val_p, x_end, val_p, color = vp_col_va_line, style = line.style_dashed, width = 1))
+                    array.push(vp_lbls, label.new(x_end, poc_p, "POC " + str.tostring(poc_p, format.mintick), style = label.style_label_left, color = color(na), textcolor = vp_col_poc, size = size.small))
+                    array.push(vp_lbls, label.new(x_end, vah_p, "VAH " + str.tostring(vah_p, format.mintick), style = label.style_label_left, color = color(na), textcolor = vp_col_va_line, size = size.small))
+                    array.push(vp_lbls, label.new(x_end, val_p, "VAL " + str.tostring(val_p, format.mintick), style = label.style_label_left, color = color(na), textcolor = vp_col_va_line, size = size.small))
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 13. TABLE (compact)
